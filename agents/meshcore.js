@@ -937,6 +937,30 @@ var networkMonitor = null;
 var nextTunnelIndex = 1;
 var apftunnel = null;
 var tunnelUserCount = { terminal: {}, files: {}, registry: {}, tcp: {}, udp: {}, msg: {} }; // List of userid->count sessions for terminal, files, registry and TCP/UDP routing
+var remotePrintSessions = {}; // List of sessionid->{ time, ... } of users with remote printing active, browsers refresh this while the remote desktop is open
+var remotePrintTimer = null;
+var remotePrintActive = false;
+
+// Remove a remote printer left behind by a previous run of the agent
+setTimeout(function () { try { require('remote-printer').cleanup(); } catch (ex) { } }, 10000);
+
+// A print job was received from the remote printer, send it to all users with remote printing active
+function onRemotePrintJob(job) {
+    var path = job.path.split('\\').join('/');
+    for (var i in remotePrintSessions) {
+        MeshServerLog('Remote printing job, ' + job.size + ' byte(s)', remotePrintSessions[i]);
+        mesh.SendCommand({ action: 'msg', type: 'remoteprint', sub: 'job', sessionid: i, path: path, name: job.name, size: job.size, format: job.format });
+    }
+}
+
+// Remove remote printing sessions that have not been refreshed, stop the remote printer when no sessions are left
+function checkRemotePrintSessions() {
+    var now = Date.now(), count = 0;
+    for (var i in remotePrintSessions) { if ((now - remotePrintSessions[i].time) > 90000) { delete remotePrintSessions[i]; } else { count++; } }
+    if (count > 0) return;
+    if (remotePrintTimer != null) { clearInterval(remotePrintTimer); remotePrintTimer = null; }
+    if (remotePrintActive) { remotePrintActive = false; try { require('remote-printer').stop(); } catch (ex) { } }
+}
 
 
 // Add to the server event log
@@ -1676,6 +1700,39 @@ function handleServerCommand(data) {
                                     mesh.SendCommand({ action: 'msg', type: 'getclip', sessionid: data.sessionid, data: str, tag: data.tag });
                                 }
                             });
+                        }
+                        break;
+                    }
+                    case 'remoteprint': {
+                        // Remote printing, install a virtual printer and send print jobs to the user's browser for download
+                        if (typeof data.sessionid != 'string') break;
+                        if (data.sub == 'start') {
+                            var isNewPrintSession = (remotePrintSessions[data.sessionid] == null);
+                            remotePrintSessions[data.sessionid] = { time: Date.now(), userid: data.userid, username: data.username, sessionid: data.sessionid, remoteaddr: data.remoteaddr };
+                            if (remotePrintTimer == null) { remotePrintTimer = setInterval(checkRemotePrintSessions, 30000); }
+                            remotePrintActive = true;
+                            try {
+                                require('remote-printer').start({ printerName: data.printerName, port: data.port }, onRemotePrintJob, function (err, printer) {
+                                    if (err != null) {
+                                        delete remotePrintSessions[data.sessionid];
+                                        mesh.SendCommand({ action: 'msg', type: 'remoteprint', sub: 'error', sessionid: data.sessionid, msg: String(err) });
+                                        checkRemotePrintSessions();
+                                    } else if (isNewPrintSession) {
+                                        MeshServerLog('Started remote printing, printer: ' + printer.name, data);
+                                        mesh.SendCommand({ action: 'msg', type: 'remoteprint', sub: 'started', sessionid: data.sessionid, name: printer.name });
+                                    }
+                                });
+                            } catch (ex) {
+                                delete remotePrintSessions[data.sessionid];
+                                mesh.SendCommand({ action: 'msg', type: 'remoteprint', sub: 'error', sessionid: data.sessionid, msg: 'Remote printing is not supported by this agent' });
+                                checkRemotePrintSessions();
+                            }
+                        } else if (data.sub == 'stop') {
+                            if (remotePrintSessions[data.sessionid] != null) {
+                                delete remotePrintSessions[data.sessionid];
+                                MeshServerLog('Stopped remote printing', data);
+                            }
+                            checkRemotePrintSessions();
                         }
                         break;
                     }
