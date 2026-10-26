@@ -15,7 +15,8 @@ var FileCommander = (function () {
     'use strict';
 
     var localSupported = (typeof window.showDirectoryPicker == 'function') && (window.isSecureContext == true);
-    var uploadWindow = 8; // Upload blocks sent but not yet acknowledged by the agent
+    var uploadWindow = 64; // Upload blocks sent but not yet acknowledged by the agent
+    var downloadWindow = 64; // Download blocks the agent may send before the next ack
     var maxEditSize = 5 * 1024 * 1024;
 
     function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
@@ -202,7 +203,7 @@ var FileCommander = (function () {
         function downloadMessage(m) {
             var d = download;
             if ((d == null) || (d.id != m.id)) return;
-            if (m.sub == 'start') { d.state = 1; rSend({ action: 'download', sub: 'startack', id: d.id }); }
+            if (m.sub == 'start') { d.state = 1; rSend({ action: 'download', sub: 'startack', id: d.id, ack: downloadWindow, bs: host.chunkSize() }); }
             else if (m.sub == 'cancel') { download = null; downloadFail(d, new Error('Unable to read the file on the device')); }
         }
 
