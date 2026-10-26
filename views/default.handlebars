@@ -10384,7 +10384,7 @@
             haltEvent(e);
             QV('p11bigfail', false);
             QV('p11bigok', false);
-            if ((xxdialogMode != null) || (desktop == null) || (desktop.State != 3) || (e.dataTransfer == null) || (e.dataTransfer.files.length == 0)) return;
+            if (xxdialogMode || (desktop == null) || (desktop.State != 3) || (e.dataTransfer == null) || (e.dataTransfer.files.length == 0)) return;
 
             if (e.shiftKey || !deskDropAllowed()) {
                 var file = e.dataTransfer.files[0];
@@ -10413,7 +10413,7 @@
         function p11fileDragOver(e) {
             haltEvent(e);
             if (p11dragtimer != null) { clearTimeout(p11dragtimer); p11dragtimer = null; }
-            var ac = ((xxdialogMode == null) && (desktop != null) && (desktop.State == 3));
+            var ac = (!xxdialogMode && (desktop != null) && (desktop.State == 3));
             QV('p11bigok', ac);
             QV('p11bigfail', !ac);
         }
@@ -10425,12 +10425,14 @@
             return ((rights & 8) != 0) && ((rights == 0xFFFFFFFF) || ((rights & 1024) == 0));
         }
 
-        // Position of a drop event in remote screen pixels, null if it is not over the remote screen
+        // Position of a drop event in remote screen pixels, null if it is not over the remote screen. Uses the canvas
+        // on-screen box, so CSS zoom or pan of the desktop view (as some UI themes add) is taken into account.
         function deskDropPosition(e) {
             var m = desktop.m;
-            if ((m.Canvas == null) || (m.CanvasId == null) || (m.CanvasId.clientWidth == 0) || (m.CanvasId.clientHeight == 0)) return null;
-            var o = m.GetPositionOfControl(m.Canvas.canvas);
-            var x = (e.pageX - o[0]) * (m.Canvas.canvas.width / m.CanvasId.clientWidth), y = (e.pageY - o[1]) * (m.Canvas.canvas.height / m.CanvasId.clientHeight);
+            if ((m.Canvas == null) || (m.Canvas.canvas == null)) return null;
+            var r = m.Canvas.canvas.getBoundingClientRect();
+            if ((r.width == 0) || (r.height == 0)) return null;
+            var x = (e.clientX - r.left) * (m.Canvas.canvas.width / r.width), y = (e.clientY - r.top) * (m.Canvas.canvas.height / r.height);
             if ((x < 0) || (y < 0) || (x > m.Canvas.canvas.width) || (y > m.Canvas.canvas.height)) return null;
             if (m.rotation != 0) { var rx = m.crotX(x, y); y = m.crotY(x, y); x = rx; }
             var scale = (m.ScalingLevel > 0) ? (1024 / m.ScalingLevel) : 1; // The agent scales the screen down by ScalingLevel / 1024
