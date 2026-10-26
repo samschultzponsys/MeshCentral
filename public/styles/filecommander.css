@@ -19,13 +19,14 @@
     box-sizing: border-box;
     min-height: 240px;
     color: var(--fc-fg);
-    background: var(--fc-bg);
+    background: transparent; /* Blend with the page or theme behind the Files tab */
     font-size: 13px;
     -webkit-user-select: none;
     user-select: none;
 }
 
-body.night .fc-root {
+/* Classic UI night mode. The modern UI sets data-bs-theme and the Bootstrap colors above follow it. */
+html:not([data-bs-theme]) body.night .fc-root {
     --fc-bg: #111;
     --fc-fg: #ddd;
     --fc-muted: #999;
@@ -47,6 +48,7 @@ body.night .fc-root {
     flex: 1 1 50%;
     min-width: 0;
     display: flex;
+    background: var(--fc-bg);
     flex-direction: column;
     border: 1px solid var(--fc-border);
     border-radius: 4px;

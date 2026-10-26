@@ -1322,10 +1322,19 @@ var FileCommander = (function () {
         obj.isBusy = function () { return (job != null) || (upload != null) || (download != null); };
 
         // Keep the commander filling the space down to the bottom of the window
+        // Themes such as Stylish UI clip the page column and pin a footer over the bottom of the window.
         function fit() {
             if (!obj.active || (root.offsetParent == null)) return;
-            var top = root.getBoundingClientRect().top;
-            root.style.height = Math.max(240, window.innerHeight - top - 4) + 'px';
+            var rect = root.getBoundingClientRect(), bottom = window.innerHeight;
+            for (var e = root.parentElement; e && (e != document.body); e = e.parentElement) {
+                if (getComputedStyle(e).overflowY != 'visible') { bottom = Math.min(bottom, e.getBoundingClientRect().bottom); }
+            }
+            var x = rect.left + (rect.width / 2), y = bottom - 2, cover = document.elementFromPoint(x, y);
+            for (var c = cover; c && !root.contains(c) && (c != document.body); c = c.parentElement) {
+                var pos = getComputedStyle(c).position;
+                if ((pos == 'fixed') || (pos == 'sticky')) { bottom = Math.min(bottom, c.getBoundingClientRect().top); break; }
+            }
+            root.style.height = Math.max(240, Math.floor(bottom - rect.top) - 4) + 'px';
         }
         obj.fit = fit;
 
