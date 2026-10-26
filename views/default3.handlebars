@@ -14905,7 +14905,7 @@
         function p13gotDownloadCommand(cmd) {
             //console.log('p13gotDownloadCommand', cmd);
             if ((gdownloadFile == null) || (cmd.id != gdownloadFile.id)) return;
-            if (cmd.sub == 'start') { gdownloadFile.state = 1; files.sendText({ action: 'download', sub: 'startack', id: gdownloadFile.id }); }
+            if (cmd.sub == 'start') { gdownloadFile.state = 1; files.sendText({ action: 'download', sub: 'startack', id: gdownloadFile.id, ack: filesTransferWindow, bs: filesTransferBlockSize(files) }); }
             else if (cmd.sub == 'cancel') { gdownloadFile = null; setDialogMode(0); }
         }
 
@@ -15043,6 +15043,13 @@
         //
 
         var uploadFile;
+
+        // File transfer tuning: number of blocks in flight and the block size, in both directions. Many blocks in flight
+        // keep high latency links busy. WebRTC data channels keep 16 KB messages.
+        var filesTransferWindow = 64;
+        function filesTransferBlockSize(tunnel) { return ((tunnel != null) && (tunnel.webrtc != null)) ? 16384 : 65536; }
+        function filesTransferSpeed(bytesPerSecond) { return (bytesPerSecond >= 1048576) ? format("{0} MB/s", (bytesPerSecond / 1048576).toFixed(1)) : format("{0} KB/s", Math.round(bytesPerSecond / 1024)); }
+
         function p13doUploadFiles(files) {
             if (xxdialogMode) return;
 
@@ -15101,6 +15108,9 @@
                 uploadFile.blocksInFlight = 0;
                 uploadFile.uploadComplete = false;
                 uploadFile.uploaddoneSent = false;
+                delete uploadFile.xfile;
+                delete uploadFile.xdata;
+                delete uploadFile.xbuf;
                 var file = uploadFile.xfiles[uploadFile.xfilePtr];
                 QH('p13dfileName', EscapeHtml(file.name));
                 Q('d2progressBar').max = file.size;
@@ -15112,14 +15122,22 @@
                     var f = null;
                     for (var i in p13filetree.dir) { if (p13filetree.dir[i].n == file.name) { f = p13filetree.dir[i]; } }
                     if ((f != null) && (f.s <= uploadFile.xfile.size)) {
-                        performHashOnFile(uploadFile.xfile, function (hash) { files.sendText(JSON.stringify({ action: 'uploadhash', reqid: uploadFile.xfilePtr, path: uploadFile.xpath, name: file.name, tag: { h: hash.toUpperCase(), s: f.s, skip: f.s == uploadFile.xfile.size } })); });
+                        // Hash the part of our file that is already on the remote device: if it matches, only the rest is sent
+                        var x = uploadFile;
+                        performHashOnFile(uploadFile.xfile.slice(0, f.s), function (hash) {
+                            if (uploadFile != x) return;
+                            if (hash == null) { files.sendText(JSON.stringify({ action: 'upload', reqid: x.xfilePtr, path: x.xpath, name: file.name, size: x.xfile.size })); return; } // Can't hash, upload the whole file
+                            files.sendText(JSON.stringify({ action: 'uploadhash', reqid: x.xfilePtr, path: x.xpath, name: file.name, tag: { h: hash.toUpperCase(), s: f.s, skip: f.s == x.xfile.size } }));
+                        });
                     } else {
                         files.sendText(JSON.stringify({ action: 'upload', reqid: uploadFile.xfilePtr, path: uploadFile.xpath, name: file.name, size: uploadFile.xfile.size }));
                     }
                 } else {
                     // Data already loaded
                     uploadFile.xdata = file.xdata;
-                    files.sendText(JSON.stringify({ action: 'upload', reqid: uploadFile.xfilePtr, path: uploadFile.xpath, name: file.name, size: uploadFile.xdata.byteLength }));
+                    uploadFile.xbuf = (file.xdata instanceof ArrayBuffer) ? new Uint8Array(file.xdata) : new Uint8Array(file.xdata.buffer, file.xdata.byteOffset, file.xdata.byteLength);
+                    uploadFile.xbufStart = 0;
+                    files.sendText(JSON.stringify({ action: 'upload', reqid: uploadFile.xfilePtr, path: uploadFile.xpath, name: file.name, size: uploadFile.xbuf.byteLength }));
                 }
             } else {
                 p13uploadFileTransferDone();
@@ -15191,6 +15209,8 @@
                 case 'uploadstart':
                     uploadFile.blocksInFlight = 0;
                     uploadFile.uploadComplete = false;
+                    uploadFile.xstartTime = Date.now();
+                    uploadFile.xstartPtr = uploadFile.xptr;
                     p13uploadNextPart();
                     break;
                 case 'uploadack':
@@ -15212,7 +15232,7 @@
                 case 'uploadhash': {
                     var file = uploadFile.xfiles[uploadFile.xfilePtr];
                     if (file) {
-                        if (cmd.tag.h === cmd.hash) {
+                        if ((typeof cmd.hash == 'string') && (cmd.tag.h === cmd.hash.toUpperCase())) {
                             if (cmd.tag.skip) {
                                 p13uploadNextFile();
                             } else {
@@ -15228,65 +15248,48 @@
             }
         }
 
-        // Push the next part of the file into the websocket, keeping up to windowSize unacked blocks in flight.
+        // Push file data into the tunnel, keeping up to filesTransferWindow blocks in flight. Files are read in 4 MB slices
+        // and sent in blocks of filesTransferBlockSize(). Each upload ack from the agent calls this again.
         function p13uploadNextPart() {
-            if (uploadFile == null) return;
-            if (uploadFile.xdata && uploadFile.xptr >= uploadFile.xdata.byteLength) return;
-            if (uploadFile.xfile && uploadFile.xptr >= uploadFile.xfile.size) return;
-            var windowSize = 8; // Max blocks sent but not yet acked
-            if (uploadFile.xdata) {
-                var data = uploadFile.xdata, start = uploadFile.xptr;
-                if (start >= data.byteLength) {
-                    files.sendText(JSON.stringify({ action: 'uploaddone', reqid: uploadFile.xfilePtr }));
+            if ((uploadFile == null) || uploadFile.uploadComplete) return;
+            var total = (uploadFile.xdata != null) ? uploadFile.xbuf.byteLength : uploadFile.xfile.size;
+            while ((uploadFile.blocksInFlight < filesTransferWindow) && (uploadFile.xptr < total)) {
+                if ((uploadFile.xbuf == null) || (uploadFile.xptr < uploadFile.xbufStart) || (uploadFile.xptr >= (uploadFile.xbufStart + uploadFile.xbuf.byteLength))) {
+                    // Read the next slice of the file, then continue
+                    if (uploadFile.xreader != null) return;
+                    var x = uploadFile, start = uploadFile.xptr, reader = new FileReader();
+                    x.xreader = reader;
+                    reader.onerror = function (err) { console.log(err); if (uploadFile == x) { p13uploadFileCancel(); } }
+                    reader.onload = function () {
+                        if (uploadFile != x) return;
+                        delete x.xreader;
+                        x.xbuf = new Uint8Array(reader.result);
+                        x.xbufStart = start;
+                        p13uploadNextPart();
+                    }
+                    reader.readAsArrayBuffer(uploadFile.xfile.slice(start, Math.min(start + 4194304, total)));
                     return;
-                } else {
-                    var end = uploadFile.xptr + (attemptWebRTC ? 16384 : 65536);
-                    if (end > data.byteLength) { end = data.byteLength; }
-                    var dataslice = new Uint8Array(data.slice(start, end))
-                    if ((dataslice[0] == 123) || (dataslice[0] == 0)) {
-                        var datapart = new Uint8Array(end - start + 1);
-                        datapart.set(dataslice, 1); // Add a zero char at the start of the send, this will indicate that it's not a JSON command.
-                        files.send(datapart);
-                    } else {
-                        files.send(dataslice); // The data does not start with 0 or 123 "{" so it can't be confused for JSON.
-                    }
-                    uploadFile.blocksInFlight++;
-                    uploadFile.xptr = end;
-                    var total = data.byteLength;
-                    Q('d2progressBar').value = Math.min(end, total - 1);
-                    Q('d2progressLabel').textContent = Math.min(99, Math.round((Math.min(end, total - 1) / total) * 100)) + '%';
-                    if (uploadFile.xptr >= data.byteLength) {
-                        uploadFile.uploadComplete = true;
-                    } else if (uploadFile.blocksInFlight < windowSize) { p13uploadNextPart(); }
                 }
-            } else if (uploadFile.xfile) {
-                if (uploadFile.xreader != null) return; // Data reading already in process
-                if (uploadFile.xptr >= uploadFile.xfile.size) return;
-                var end = uploadFile.xptr + (attemptWebRTC ? 16384 : 65536);
-                if (end > uploadFile.xfile.size) { end = uploadFile.xfile.size; }
-                uploadFile.xreader = new FileReader();
-                uploadFile.xreader.onerror = function (err) { console.log(err); }
-                uploadFile.xreader.onload = function () {
-                    var data = uploadFile.xreader.result;
-                    delete uploadFile.xreader;
-                    if (data == null) return;
-                    var dataslice = new Uint8Array(data)
-                    if ((dataslice[0] == 123) || (dataslice[0] == 0)) {
-                        var datapart = new Uint8Array(data.byteLength + 1);
-                        datapart.set(dataslice, 1); // Add a zero char at the start of the send, this will indicate that it's not a JSON command.
-                        files.send(datapart);
-                    } else {
-                        files.send(dataslice); // The data does not start with 0 or 123 "{" so it can't be confused for JSON.
-                    }
-                    uploadFile.blocksInFlight++;
-                    uploadFile.xptr = end;
-                    Q('d2progressBar').value = Math.min(end, uploadFile.xfile.size - 1);
-                    Q('d2progressLabel').textContent = Math.min(99, Math.round((Math.min(end, uploadFile.xfile.size - 1) / uploadFile.xfile.size) * 100)) + '%';
-                    if (uploadFile.xptr >= uploadFile.xfile.size) {
-                        uploadFile.uploadComplete = true;
-                    } else if (uploadFile.blocksInFlight < windowSize) { p13uploadNextPart(); }
-                };
-                uploadFile.xreader.readAsArrayBuffer(uploadFile.xfile.slice(uploadFile.xptr, end));
+                var end = Math.min(uploadFile.xptr + filesTransferBlockSize(files), uploadFile.xbufStart + uploadFile.xbuf.byteLength);
+                var block = uploadFile.xbuf.subarray(uploadFile.xptr - uploadFile.xbufStart, end - uploadFile.xbufStart);
+                if ((block[0] == 123) || (block[0] == 0)) {
+                    // Add a zero char at the start of the send, this will indicate that it's not a JSON command.
+                    var escaped = new Uint8Array(block.byteLength + 1);
+                    escaped.set(block, 1);
+                    block = escaped;
+                }
+                files.send(block); // The data does not start with 0 or 123 "{" so it can't be confused for JSON.
+                uploadFile.blocksInFlight++;
+                uploadFile.xptr = end;
+            }
+            var shown = Math.min(uploadFile.xptr, total - 1), label = Math.min(99, Math.round((shown / total) * 100)) + '%';
+            var seconds = (Date.now() - uploadFile.xstartTime) / 1000;
+            if (seconds > 1) { label += ', ' + filesTransferSpeed((uploadFile.xptr - uploadFile.xstartPtr) / seconds); }
+            Q('d2progressBar').value = shown;
+            Q('d2progressLabel').textContent = label;
+            if (uploadFile.xptr >= total) {
+                uploadFile.uploadComplete = true;
+                if (uploadFile.blocksInFlight == 0) { uploadFile.uploaddoneSent = true; files.sendText(JSON.stringify({ action: 'uploaddone', reqid: uploadFile.xfilePtr })); } // Empty file, nothing to wait for
             }
         }
 
