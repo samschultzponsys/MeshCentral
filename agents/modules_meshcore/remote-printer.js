@@ -32,6 +32,8 @@ var DEFAULT_TCP_PORT = 35500;
 var MAX_JOB_SIZE = 256 * 1024 * 1024;               // Larger jobs are dropped
 var MAX_JOB_AGE = 15 * 60 * 1000;                   // Jobs older than this are deleted
 var COMMAND_TIMEOUT = 2 * 60 * 1000;                // PowerShell or lpadmin commands are killed after this
+var JOB_END_DELAY = 2000;                           // A PDF job is complete when no data arrives this long after its %%EOF marker
+var JOB_IDLE_TIMEOUT = 30 * 1000;                   // Any job is complete when no data arrives this long
 
 var sep = (process.platform == 'win32') ? '\\' : '/';
 var agentFolder = process.execPath.substring(0, process.execPath.lastIndexOf(sep));
@@ -245,17 +247,32 @@ function startListener(port, onJob, func) {
     try { fs.mkdirSync(jobsFolder); } catch (ex) { }
     var s = require('net').createServer();
     s.on('connection', function (socket) {
-        var job = { id: ++jobCounter, time: Date.now(), size: 0, head: null, fd: null, done: false };
+        var job = { id: ++jobCounter, time: Date.now(), size: 0, head: null, tail: '', fd: null, done: false, timer: null };
         job.tmpPath = jobsFolder + sep + 'print-' + job.time + '-' + job.id + '.tmp';
         try { job.fd = fs.openSync(job.tmpPath, 'wbN'); } catch (ex) { socket.end(); return; }
+
+        // The Windows spooler only completes the job, and starts the next one, once the printer closes the connection.
+        // So close it when the job is complete: when the other side ends it, or when no more data arrives.
+        var restartTimer = function () {
+            if (job.timer != null) { clearTimeout(job.timer); }
+            job.timer = setTimeout(finish, (job.tail.indexOf('%%EOF') >= 0) ? JOB_END_DELAY : JOB_IDLE_TIMEOUT);
+        };
         socket.on('data', function (chunk) {
             if ((job.done) || (job.fd == null)) return;
             if (job.head == null) { job.head = Buffer.from(chunk.slice(0, 1024)); }
+            job.tail = (job.tail + chunk.slice(Math.max(0, chunk.length - 32)).toString('binary')).slice(-32);
             job.size += chunk.length;
-            if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } socket.end(); return; }
+            restartTimer();
+            if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } finish(); return; }
             try { fs.writeSync(job.fd, chunk); } catch (ex) { }
         });
         var finish = function () {
+            if (job.timer != null) { clearTimeout(job.timer); job.timer = null; }
+            if (job.closing !== true) {
+                job.closing = true;
+                try { socket.end(); } catch (ex) { }
+                setTimeout(function () { try { if (typeof socket.destroy == 'function') { socket.destroy(); } } catch (ex) { } }, 5000); // If the other side keeps it half open
+            }
             if (job.done) return;
             job.done = true;
             if (job.fd == null) return; // Job was dropped
@@ -271,6 +288,7 @@ function startListener(port, onJob, func) {
         socket.on('end', finish);
         socket.on('close', finish);
         socket.on('error', finish);
+        restartTimer(); // Also closes connections that never send anything
     });
     s.on('error', function (err) { });
     try {
