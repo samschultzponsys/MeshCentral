@@ -12135,7 +12135,7 @@
         var deskDropTunnel = null;
         function deskDropUpload(xfiles, pos) {
             if ((uploadFile != null) || (deskDropTunnel != null)) return;
-            setModalContent('xxAddAgent', "Upload File", '<div id=p13dfileName>' + "Finding the destination folder..." + '</div><br /><progress id=d2progressBar style="display:block;width:100%;margin-bottom:5px"></progress>');
+            setModalContent('xxAddAgent', "Upload File", '<div id=p13dfileName>' + "Connecting to the remote device..." + '</div><br /><progress id=d2progressBar style="display:block;width:100%;margin-bottom:5px"></progress>');
             showModal('xxAddAgentModal', 'idx_dlgCancelButton', function () { deskDropDone(deskDropTunnel, false); });
             document.getElementById('idx_dlgOkButton').style.display = 'none'; // hide OK button
             var t = CreateAgentRedirect(meshserver, CreateRemoteFiles(function (data) { deskDropGotData(t, data); }, function (data) { if ((data.length > 0) && (data[0] == 123)) { var x = ''; for (var i = 0; i < data.length; i += 8192) { x += String.fromCharCode.apply(null, data.subarray(i, i + 8192)); } deskDropGotData(t, x); } }), serverPublicNamePort, authCookie, authRelayCookie, domainUrl);
@@ -12147,8 +12147,12 @@
             t.xfiles = xfiles;
             t.xpos = pos;
             t.xmode = desktopsettings.dropfolder || 'auto';
+            t.xtimer = setTimeout(function () { deskDropDone(t, false, "Could not open a file session to the remote device."); }, 30000);
             t.onStateChanged = function (tunnel, state) {
                 if (state == 3) {
+                    if (tunnel.xtimer) { clearTimeout(tunnel.xtimer); delete tunnel.xtimer; }
+                    QH('p13dfileName', "Finding the destination folder...");
+                    tunnel.xtimer = setTimeout(function () { deskDropDone(tunnel, false, "The remote device did not answer, it may need an agent update."); }, 25000);
                     if ((t.xmode == 'custom') && desktopsettings.dropcustom) {
                         // Folder set in the desktop settings, list it to avoid overwriting files
                         t.xpath = desktopsettings.dropcustom;
@@ -12156,7 +12160,6 @@
                         return;
                     }
                     tunnel.sendText({ action: 'droptarget', reqid: 1, mode: t.xmode, x: (pos ? pos.x : null), y: (pos ? pos.y : null), display: (pos ? pos.display : null) });
-                    tunnel.xtimer = setTimeout(function () { deskDropDone(tunnel, false, "The remote device did not answer, it may need an agent update."); }, 25000);
                 } else if (state == 0) {
                     deskDropDone(tunnel, false, "Lost the connection to the remote device.");
                 }
@@ -12178,6 +12181,7 @@
                 if ((data.v == null) && (data.kind == 'downloads')) { t.xnote = "the agent is running older code, reconnect it to update"; }
                 t.sendText({ action: 'ls', reqid: 2, path: t.xpath }); // List the folder to avoid overwriting files
             } else if ((data.reqid == 2) && (t.xpath != null) && (t.xnames == null)) {
+                if (t.xtimer) { clearTimeout(t.xtimer); delete t.xtimer; }
                 if (data.dir == null) { deskDropDone(t, false, format("Could not open {0} on the remote device.", t.xpath)); return; }
                 var used = [];
                 for (var i in data.dir) { used.push(data.dir[i].n.toLowerCase()); }
