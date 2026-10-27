@@ -240,11 +240,21 @@ function cleanJobs(all) {
     }
 }
 
+// Position of an ASCII string in an array of bytes, or -1. Plain arrays are used for the job's first and
+// last bytes since the agent's Buffer doesn't support Buffer.from(buffer) or toString('binary').
+function indexOfBytes(bytes, str) {
+    for (var i = 0; i + str.length <= bytes.length; i++) {
+        var j = 0;
+        while ((j < str.length) && (bytes[i + j] == str.charCodeAt(j))) { j++; }
+        if (j == str.length) return i;
+    }
+    return -1;
+}
+
 // Figure out the file extension from the first bytes of the job
 function getJobExtension(head) {
-    var str = head.toString('binary');
-    if (str.indexOf('%PDF') >= 0) return 'pdf';
-    if (str.indexOf('%!PS') >= 0) return 'ps';
+    if (indexOfBytes(head, '%PDF') >= 0) return 'pdf';
+    if (indexOfBytes(head, '%!PS') >= 0) return 'ps';
     if ((head.length >= 2) && (head[0] == 0x50) && (head[1] == 0x4B)) return 'xps';
     return 'prn';
 }
@@ -255,7 +265,7 @@ function startListener(port, onJob, func) {
     var s = require('net').createServer();
     s.on('connection', function (socket) {
         if (s.onCheckConnection != null) { var f = s.onCheckConnection; s.onCheckConnection = null; f(); }
-        var job = { id: ++jobCounter, time: Date.now(), size: 0, head: null, tail: '', fd: null, done: false, timer: null };
+        var job = { id: ++jobCounter, time: Date.now(), size: 0, head: [], tail: [], fd: null, done: false, timer: null };
         job.tmpPath = jobsFolder + sep + 'print-' + job.time + '-' + job.id + '.tmp';
         try { job.fd = fs.openSync(job.tmpPath, 'wbN'); } catch (ex) { socket.end(); return; }
 
@@ -263,7 +273,7 @@ function startListener(port, onJob, func) {
         // So close it when the job is complete: when the other side ends it, or when no more data arrives.
         var restartTimer = function () {
             if (job.timer != null) { clearTimeout(job.timer); }
-            if (job.tail.indexOf('%%EOF') >= 0) {
+            if (indexOfBytes(job.tail, '%%EOF') >= 0) {
                 job.timer = setTimeout(function () { finish('end of PDF'); }, JOB_END_DELAY);
             } else {
                 job.timer = setTimeout(function () { finish('no data for ' + (JOB_IDLE_TIMEOUT / 1000) + ' seconds'); }, JOB_IDLE_TIMEOUT);
@@ -271,12 +281,18 @@ function startListener(port, onJob, func) {
         };
         socket.on('data', function (chunk) {
             if ((job.done) || (job.fd == null)) return;
-            if (job.head == null) { job.head = Buffer.from(chunk.slice(0, 1024)); }
-            job.tail = (job.tail + chunk.slice(Math.max(0, chunk.length - 32)).toString('binary')).slice(-32);
-            job.size += chunk.length;
-            restartTimer();
-            if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } finish('job too large, dropped'); return; }
-            try { fs.writeSync(job.fd, chunk); } catch (ex) { }
+            try {
+                var i;
+                for (i = 0; (i < chunk.length) && (job.head.length < 1024); i++) { job.head.push(chunk[i]); } // First bytes, to find the format
+                for (i = Math.max(0, chunk.length - 32); i < chunk.length; i++) { job.tail.push(chunk[i]); } // Last bytes, to find the end of a PDF
+                if (job.tail.length > 32) { job.tail.splice(0, job.tail.length - 32); }
+                job.size += chunk.length;
+                restartTimer();
+                if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } finish('job too large, dropped'); return; }
+                fs.writeSync(job.fd, chunk);
+            } catch (ex) {
+                if (job.dataError == null) { job.dataError = String(ex); log('Job ' + job.id + ': error receiving data: ' + ex); }
+            }
         });
         var finish = function (reason) {
             if (job.timer != null) { clearTimeout(job.timer); job.timer = null; }
