@@ -9892,20 +9892,22 @@
             }
         }
 
-        // Remote Download: download the file(s) highlighted in Windows Explorer, found using "Run Commands" as the logged in user.
+        // Remote Download: download the file(s) highlighted in Windows Explorer, found using "Run Commands" (needs the Run Commands right).
         // If there are none, download the remote file(s) whose path is on the remote clipboard, and if there is none, ask for a path.
         // On Windows, right-click the file and use "Copy as path" (or Ctrl+Shift+C), on Linux copy the file in the file manager.
         var deskRemoteDownloadTimer = null;
         var deskRemoteDownloadStep = null; // 'selection' or 'clipboard' while waiting for the device
         var deskRemoteDownloadFiles = null; // Files listed in the selection dialog
-        // Single line PowerShell, it is read line by line from stdin. Output is base64 JSON between markers, so terminal output around it does not matter.
-        var deskRemoteDownloadSelectionScript = "$m='@@MESH'+'RD@@';$r=@();try{foreach($w in (New-Object -ComObject Shell.Application).Windows()){try{if($w.FullName -match 'explorer\\.exe$'){$s=@();foreach($i in $w.Document.SelectedItems()){if($i.Path -and (Test-Path -LiteralPath $i.Path -PathType Leaf)){$s+=[string]$i.Path}};if($s.Count -gt 0){$r+=@{f=[string]$w.Document.Folder.Self.Path;s=$s}}}}catch{}}}catch{};[Console]::Out.Write($m+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -Depth 3 -InputObject @($r))))+$m)";
+        // Single line PowerShell, it is read line by line from stdin. "Run as user" can still run as SYSTEM, which can't see the user's Explorer windows,
+        // so this runs as the agent and starts the Explorer query as the console user with a one-time scheduled task, like the agent does to open a URL.
+        // Output is base64 JSON between markers, so terminal output around it does not matter.
+        var deskRemoteDownloadSelectionScript = "$m='@@MESH'+'RD@@';$j='[]';$n=$null;$d=$null;try{$u=(Get-CimInstance Win32_ComputerSystem).UserName;if(-not $u){$p=Get-CimInstance Win32_Process -Filter 'Name=''explorer.exe''' | Select-Object -First 1;if($p){$q=Invoke-CimMethod -InputObject $p -MethodName GetOwner;if($q.User){$u=$q.Domain+'\\'+$q.User}}};if($u){$d=Join-Path $env:windir ('Temp\\MeshRD-'+[guid]::NewGuid());New-Item -ItemType Directory -Path $d | Out-Null;icacls $d /grant ($u+':(OI)(CI)M') | Out-Null;$f=Join-Path $d 'out.json';$c=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(('$r=@();try{foreach($w in (New-Object -ComObject Shell.Application).Windows()){try{if($w.FullName -match ''explorer\\.exe$''){$s=@();foreach($i in $w.Document.SelectedItems()){if($i.Path -and (Test-Path -LiteralPath $i.Path -PathType Leaf)){$s+=[string]$i.Path}};if($s.Count -gt 0){$r+=@{f=[string]$w.Document.Folder.Self.Path;s=$s}}}}catch{}}}catch{};$o=''@@OUT@@'';[IO.File]::WriteAllText($o+''.tmp'',(ConvertTo-Json -Compress -Depth 3 -InputObject @($r)));Move-Item -LiteralPath ($o+''.tmp'') -Destination $o').Replace('@@OUT@@',$f)));$n='MeshRD-'+[guid]::NewGuid();$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand '+$c);Register-ScheduledTask -TaskName $n -Action $a -Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive) -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) -Force | Out-Null;Start-ScheduledTask -TaskName $n;for($i=0;($i -lt 50) -and (-not (Test-Path -LiteralPath $f));$i++){Start-Sleep -Milliseconds 200};if(Test-Path -LiteralPath $f){$j=[IO.File]::ReadAllText($f)}}}catch{}finally{if($n){Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue};if($d){Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue}};[Console]::Out.Write($m+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m)";
         function deskRemoteDownloadFunction() {
             if (xxdialogMode || (desktop == null) || (desktop.State != 3) || (currentNode == null) || (deskRemoteDownloadStep != null)) return;
             if (isWindowsNode(currentNode) && ((GetNodeRights(currentNode) & 131072) != 0)) {
-                // Ask Explorer for the highlighted files. If nothing comes back (no user logged in, agent busy running other commands), use the clipboard.
-                deskRemoteDownloadWait('selection', 10000, deskRemoteDownloadClipboard);
-                meshserver.send({ action: 'runcommands', nodeids: [currentNode._id], type: 2, runAsUser: 2, reply: true, responseid: 'deskRemoteDownload', cmds: deskRemoteDownloadSelectionScript });
+                // Ask Explorer for the highlighted files, this takes a few seconds. If nothing comes back (agent busy running other commands), use the clipboard.
+                deskRemoteDownloadWait('selection', 20000, deskRemoteDownloadClipboard);
+                meshserver.send({ action: 'runcommands', nodeids: [currentNode._id], type: 2, runAsUser: 0, reply: true, responseid: 'deskRemoteDownload', cmds: deskRemoteDownloadSelectionScript });
             } else {
                 deskRemoteDownloadClipboard();
             }
