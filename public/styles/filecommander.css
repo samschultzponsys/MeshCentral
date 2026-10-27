@@ -451,3 +451,25 @@ html:not([data-bs-theme]) body.night .fc-root {
         font-size: 0;
     }
 }
+
+/* Folder row a drag will drop into */
+.fc-row.fc-droprow td {
+    background: var(--fc-sel);
+    color: var(--fc-sel-fg);
+    box-shadow: inset 0 0 0 2px var(--fc-accent) !important;
+}
+
+.fc-fav.fc-on {
+    color: #e0a400;
+}
+
+.fc-row.fc-place td.fc-name {
+    font-weight: 500;
+}
+
+.fc-empty.fc-hint {
+    padding: 12px 14px;
+    text-align: left;
+    font-size: 12px;
+    line-height: 1.5;
+}
