@@ -6578,6 +6578,14 @@
             return r;
         }
 
+        // Device name matcher: the search is split into words on spaces and symbols, a name matches when it contains all the words in any order.
+        // So "gulf orange" and "gulf - orange" both match "The Gulf - Orange Beach". If the search has no words (only symbols), it is matched as typed.
+        function getDeviceNameMatcher(x) {
+            var words = x.toLowerCase().split(/[\s!-\/:-@\[-`{-~]+/).filter(function (w) { return w != ''; });
+            if (words.length == 0) { words = [x.toLowerCase()]; }
+            return { test: function (name) { if (name == null) return false; name = name.toLowerCase(); for (var i in words) { if (name.indexOf(words[i]) < 0) return false; } return true; } };
+        }
+
         function getDevicesThatMatchFilter(x) {
             var negate = x.startsWith('!');
             if (negate) x = x.substring(1);
@@ -6682,7 +6690,7 @@
             } else {
                 // Device name search
                 try {
-                    var rs = x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), rx = new RegExp(rs); // In some cases (like +), this can throw an exception.
+                    var rx = getDeviceNameMatcher(x);
                       for (var d in nodes) {
                         if (features2 & 0x00008000) { // Both server and client names must match
                             if(features2 & 0x10000000){
