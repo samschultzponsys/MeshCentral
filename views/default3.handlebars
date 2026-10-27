@@ -2195,6 +2195,19 @@
                                         </div>
                                     </div>
                                 </fieldset>
+                                <div class="form-floating mb-2 mt-2">
+                                    <select id="d7dropfolder" class="form-select" onchange="d7dropFolderChanged()">
+                                        <option value="auto">Folder under the mouse</option>
+                                        <option value="downloads">Downloads</option>
+                                        <option value="desktop">Desktop</option>
+                                        <option value="custom">Custom folder</option>
+                                    </select>
+                                    <label for="d7dropfolder">Dropped files go to</label>
+                                </div>
+                                <div id="d7dropcustomdiv" class="form-floating mb-2" style="display:none">
+                                    <input id="d7dropcustom" class="form-control" type="text" placeholder="C:\Users\Public\Downloads" />
+                                    <label for="d7dropcustom">Custom folder on the remote device</label>
+                                </div>
                             </div>
                             <div id="d7amtkvm" class="tab-pane">
                                 <!--<h4>Intel&reg; AMT Hardware KVM</h4>-->
@@ -11616,6 +11629,8 @@
             desktopsettings.remotekeymap = d7deskRemoteKeyMap.checked;
             desktopsettings.autoclipboard = d7deskAutoClipboard.checked;
             desktopsettings.autolock = d7deskAutoLock.checked;
+            desktopsettings.dropfolder = d7dropfolder.value;
+            desktopsettings.dropcustom = d7dropcustom.value.trim();
             desktopsettings.localkeymap = d7localKeyMap.checked;
             desktopsettings.kvmrmw = d7kvmrmw.checked;
             desktopsettings.rdpsize = d7rdpsize.value;
@@ -11668,6 +11683,9 @@
             if (desktopsettings.remotekeymap != null) { d7deskRemoteKeyMap.checked = desktopsettings.remotekeymap; }
             if (desktopsettings.autoclipboard != null) { d7deskAutoClipboard.checked = desktopsettings.autoclipboard; }
             if (desktopsettings.autolock != null) { d7deskAutoLock.checked = desktopsettings.autolock; }
+            d7dropfolder.value = desktopsettings.dropfolder || 'auto';
+            d7dropcustom.value = desktopsettings.dropcustom || '';
+            d7dropFolderChanged();
             if (desktopsettings.localkeymap) { d7localKeyMap.checked = desktopsettings.localkeymap; }
             if (desktopsettings.kvmrmw) { d7kvmrmw.checked = desktopsettings.kvmrmw; }
             QV('deskFocusBtn', (desktop != null) && (desktop.contype == 2) && (desktop.state != 0) && (desktopsettings.showfocus));
@@ -11916,9 +11934,16 @@
             if ((desktop.options != null) && (desktop.options.tsid != null)) { t.options.tsid = desktop.options.tsid; } // Same user session as the desktop
             t.xfiles = xfiles;
             t.xpos = pos;
+            t.xmode = desktopsettings.dropfolder || 'auto';
             t.onStateChanged = function (tunnel, state) {
                 if (state == 3) {
-                    tunnel.sendText({ action: 'droptarget', reqid: 1, x: (pos ? pos.x : null), y: (pos ? pos.y : null), display: (pos ? pos.display : null) });
+                    if ((t.xmode == 'custom') && desktopsettings.dropcustom) {
+                        // Folder set in the desktop settings, list it to avoid overwriting files
+                        t.xpath = desktopsettings.dropcustom;
+                        t.sendText({ action: 'ls', reqid: 2, path: t.xpath });
+                        return;
+                    }
+                    tunnel.sendText({ action: 'droptarget', reqid: 1, mode: t.xmode, x: (pos ? pos.x : null), y: (pos ? pos.y : null), display: (pos ? pos.display : null) });
                     tunnel.xtimer = setTimeout(function () { deskDropDone(tunnel, false, "The remote device did not answer, it may need an agent update."); }, 25000);
                 } else if (state == 0) {
                     deskDropDone(tunnel, false, "Lost the connection to the remote device.");
@@ -11937,6 +11962,7 @@
                 if (typeof data.path != 'string') { deskDropDone(t, false, "Could not find a folder on the remote device for the dropped files." + ((typeof data.error == 'string') ? ('<br />' + EscapeHtml(data.error)) : '')); return; }
                 t.xpath = data.path;
                 t.xkind = data.kind;
+                t.xnote = data.note;
                 t.sendText({ action: 'ls', reqid: 2, path: t.xpath }); // List the folder to avoid overwriting files
             } else if ((data.reqid == 2) && (t.xpath != null) && (t.xnames == null)) {
                 if (data.dir == null) { deskDropDone(t, false, format("Could not open {0} on the remote device.", t.xpath)); return; }
@@ -11948,6 +11974,9 @@
                 p13startUpload(t.xfiles, { tunnel: t, path: t.xpath, names: t.xnames, drop: true, done: function (ok) { deskDropDone(t, ok); } });
             }
         }
+
+        // Show the custom folder box when the custom drop folder is picked in the desktop settings
+        function d7dropFolderChanged() { QV('d7dropcustomdiv', d7dropfolder.value == 'custom'); }
 
         // Add " (1)", " (2)"... before the extension until the name is not in the used list (lower case names)
         function deskDropUniqueName(name, used) {
@@ -11965,7 +11994,10 @@
             if ((uploadFile != null) && (uploadFile.tunnel == t)) { p13uploadFileCancel(); }
             if (t.xfinding) { setDialogMode(0); }
             try { t.Stop(); } catch (ex) { }
-            if (ok) { msg = (t.xnames.length == 1) ? format("Uploaded {0} to {1}", t.xnames[0], t.xpath) : format("Uploaded {0} files to {1}", t.xnames.length, t.xpath); }
+            if (ok) {
+                msg = (t.xnames.length == 1) ? format("Uploaded {0} to {1}", t.xnames[0], t.xpath) : format("Uploaded {0} files to {1}", t.xnames.length, t.xpath);
+                if ((t.xmode == 'auto') && (typeof t.xnote == 'string')) { msg += '<br /><span style="opacity:0.7;font-size:smaller">' + format("No folder window found where the files were dropped ({0})", t.xnote) + '</span>'; }
+            }
             if (msg) {
                 QH('p11DeskConsoleMsg', msg); // format() escapes the names and paths
                 QV('p11DeskConsoleMsg', true);
