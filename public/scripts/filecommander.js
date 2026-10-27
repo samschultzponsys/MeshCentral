@@ -29,6 +29,9 @@ var FileCommander = (function () {
     }
 
     function fileType(item) {
+        if (item.kind == 'place') return item.fav ? 'Favorite' : 'Recent folder';
+        if (item.kind == 'dlplace') return 'Browser downloads';
+        if (item.kind == 'browse') return '';
         if (item.kind == 'drive') { return (item.dt == 'REMOVABLE') ? 'Removable Disk' : ((item.dt == 'CDROM') ? 'CD Drive' : ((item.dt == 'NETWORK') ? 'Network Drive' : 'Local Disk')); }
         if (item.kind == 'dir') return 'File Folder';
         var i = item.name.lastIndexOf('.');
@@ -87,6 +90,8 @@ var FileCommander = (function () {
         var job = null;          // Running copy/move job
         var remoteDrives = null; // Root listing of a Windows device
         var recentLocal = [];    // Recently used local folder handles
+        var favLocal = [];       // Favorite local folder handles
+        var favRemote = storeGet('fcFavRemote', []); // Favorite device folders: [{ w: windows, segs }]
         var menuEl = null, modalEl = null;
         var dragSource = null;
 
@@ -237,7 +242,8 @@ var FileCommander = (function () {
 
         function localSink(dirHandle, name) {
             return dirHandle.getFileHandle(name, { create: true }).then(function (fh) { return fh.createWritable(); }).then(function (w) {
-                return { write: function (b) { return w.write(b); }, close: function () { return w.close(); }, abort: function () { try { w.abort(); } catch (ex) { } } };
+                var aborted = null;
+                return { write: function (b) { return w.write(b); }, close: function () { return w.close(); }, abort: function () { if (aborted == null) { aborted = w.abort().catch(function () { }); } return aborted; } };
             });
         }
 
@@ -278,7 +284,7 @@ var FileCommander = (function () {
 
         function paneLabel(p) {
             if (p.type == 'remote') return rDisplay(p.segs);
-            if (p.stack.length == 0) return '';
+            if (p.stack.length == 0) return 'This computer';
             return p.stack.map(function (h) { return h.name; }).join('\\') + '\\';
         }
 
@@ -289,15 +295,18 @@ var FileCommander = (function () {
             if (key == 'size') { cmp = function (a, b) { return ((a.size || 0) - (b.size || 0)) || byName(a, b); }; }
             else if (key == 'date') { cmp = function (a, b) { return ((a.date || 0) - (b.date || 0)) || byName(a, b); }; }
             else if (key == 'type') { cmp = function (a, b) { return fileType(a).localeCompare(fileType(b)) || byName(a, b); }; }
+            if (localRoot(p)) { p.rows = p.items.slice(); return; } // Keep the order of the places list
             var rank = { drive: 0, dir: 1, file: 2 };
             var list = p.items.slice().sort(function (a, b) { return (rank[a.kind] - rank[b.kind]) || (cmp(a, b) * dir); });
             p.rows = (atRoot(p) ? [] : [{ up: true, name: '..', kind: 'up' }]).concat(list);
         }
 
-        function atRoot(p) { return (p.type == 'remote') ? (p.segs.length == 0) : (p.stack.length <= 1); }
+        function atRoot(p) { return (p.type == 'remote') ? (p.segs.length == 0) : (p.stack.length == 0); }
+        function localRoot(p) { return (p.type == 'local') && (p.stack.length == 0); }
+        function isEntry(r) { return (r.kind == 'file') || (r.kind == 'dir'); }
 
         function saveState() {
-            storeSet('fcTypes', [panes[0].type, panes[1].type]);
+            storeSet('fcTypes2', [panes[0].type, panes[1].type]);
             storeSet('fcSort', [[panes[0].sortKey, panes[0].sortDir], [panes[1].sortKey, panes[1].sortDir]]);
             if (host.nodeId()) {
                 var paths = storeGet('fcPaths', []).filter(function (x) { return x.n != host.nodeId(); });
@@ -335,14 +344,13 @@ var FileCommander = (function () {
 
         async function loadLocal(p, stack, keepMarks, focusName) {
             if (p.type != 'local') return false;
-            if (stack.length == 0) { p.stack = []; p.items = []; p.rows = []; p.message = null; renderPane(p); return false; }
             var seq = ++p.loadSeq;
             p.loading = true; renderStatus(p);
             var items;
-            try { items = await localEntries(stack[stack.length - 1]); } catch (ex) { if (seq == p.loadSeq) { p.loading = false; flash(p, ex.message); renderStatus(p); } return false; }
+            try { items = (stack.length == 0) ? (await placeItems()) : (await localEntries(stack[stack.length - 1])); } catch (ex) { if (seq == p.loadSeq) { p.loading = false; flash(p, ex.message); renderStatus(p); } return false; }
             if ((seq != p.loadSeq) || (p.type != 'local')) return false;
             p.loading = false;
-            var samePath = (stack.length == p.stack.length) && (stack[stack.length - 1] === p.stack[p.stack.length - 1]);
+            var samePath = (stack.length == p.stack.length) && ((stack.length == 0) || (stack[stack.length - 1] === p.stack[p.stack.length - 1]));
             var prevName = (p.rows[p.cursor] != null) ? p.rows[p.cursor].name : null;
             p.stack = stack;
             p.items = items;
@@ -371,6 +379,9 @@ var FileCommander = (function () {
         function openRow(p, row) {
             if (row == null) return;
             if (row.up) { goUp(p); return; }
+            if (row.kind == 'place') { chooseLocalFolder(p, row.handle); return; }
+            if (row.kind == 'browse') { chooseLocalFolder(p); return; }
+            if (row.kind == 'dlplace') { flash(p, 'Copy or drag device files here to save them to your Downloads folder', true); return; }
             if ((row.kind == 'dir') || (row.kind == 'drive')) {
                 if (p.type == 'remote') { loadRemote(p, p.segs.concat([row.name])); }
                 else { loadLocal(p, p.stack.concat([row.handle])); }
@@ -387,14 +398,14 @@ var FileCommander = (function () {
 
         function goRoot(p) {
             if (p.type == 'remote') { loadRemote(p, []); }
-            else if (p.stack.length > 0) { loadLocal(p, p.stack.slice(0, 1)); }
+            else { loadLocal(p, []); }
         }
 
         function gotoPath(p, text) {
             if (p.type == 'remote') { loadRemote(p, rParse(text)); return; }
             // Local panes can only move inside the chosen folder
             var parts = rParse(text), stack = p.stack.slice(0, 1);
-            if ((stack.length == 0) || (parts.length == 0) || (parts[0] != stack[0].name)) { flash(p, 'Local paths must start with ' + (stack.length ? stack[0].name : 'a chosen folder')); renderPath(p); return; }
+            if ((stack.length == 0) || (parts.length == 0) || (parts[0] != stack[0].name)) { flash(p, (stack.length == 0) ? 'Open a folder first' : ('Local paths must start with ' + stack[0].name)); renderPath(p); return; }
             (async function () {
                 var s = stack.slice();
                 for (var i = 1; i < parts.length; i++) {
@@ -417,8 +428,90 @@ var FileCommander = (function () {
             }
             recentLocal = list;
             idbSet('recent', recentLocal);
+            idbSet('last' + p.idx, handle);
             renderDrives(panes[0]); renderDrives(panes[1]);
             loadLocal(p, [handle]);
+        }
+
+        // The "This computer" list. Browsers cannot list drives, so it shows the folders picked before.
+        async function placeItems() {
+            var items = [{ name: 'Browse for a folder...', kind: 'browse' }], seen = [];
+            async function add(hd, fav) {
+                for (var i = 0; i < seen.length; i++) { try { if (await seen[i].isSameEntry(hd)) return; } catch (ex) { } }
+                seen.push(hd);
+                items.push({ name: hd.name, kind: 'place', handle: hd, fav: fav });
+            }
+            for (var i = 0; i < favLocal.length; i++) { await add(favLocal[i], true); }
+            for (var i = 0; i < recentLocal.length; i++) { await add(recentLocal[i], false); }
+            items.push({ name: 'Downloads (save with the browser)', kind: 'dlplace' });
+            return items;
+        }
+
+        async function localFavIndex(handle) {
+            for (var i = 0; i < favLocal.length; i++) { try { if (await favLocal[i].isSameEntry(handle)) return i; } catch (ex) { } }
+            return -1;
+        }
+
+        function remoteFavIndex(segs) {
+            var w = host.isWindows(), key = segs.join('/');
+            if (w) { key = key.toLowerCase(); }
+            for (var i = 0; i < favRemote.length; i++) {
+                var f = favRemote[i];
+                if ((f.w == w) && ((w ? f.segs.join('/').toLowerCase() : f.segs.join('/')) == key)) return i;
+            }
+            return -1;
+        }
+
+        // row: a folder row to add or remove, or null for the folder the pane shows
+        async function toggleFavorite(p, row) {
+            if (p.type == 'remote') {
+                var segs = row ? p.segs.concat([row.name]) : p.segs;
+                if (segs.length == 0) return;
+                var i = remoteFavIndex(segs);
+                if (i >= 0) { favRemote.splice(i, 1); flash(p, 'Removed from favorites', true); }
+                else { favRemote.push({ w: host.isWindows(), segs: segs.slice() }); flash(p, 'Added to favorites', true); }
+                storeSet('fcFavRemote', favRemote);
+            } else {
+                var hd = row ? row.handle : p.stack[p.stack.length - 1];
+                if (hd == null) return;
+                var j = await localFavIndex(hd);
+                if (j >= 0) { favLocal.splice(j, 1); flash(p, 'Removed from favorites', true); }
+                else { favLocal.push(hd); flash(p, 'Added to favorites', true); }
+                idbSet('favorites', favLocal);
+                panes.forEach(function (x) { if (localRoot(x)) { loadLocal(x, [], true); } });
+            }
+            renderDrives(panes[0]); renderDrives(panes[1]);
+            updateFavButton(panes[0]); updateFavButton(panes[1]);
+        }
+
+        async function removePlaces(p, rows) {
+            for (var i = 0; i < rows.length; i++) {
+                if (rows[i].kind != 'place') continue;
+                var hd = rows[i].handle, keep = [];
+                for (var j = 0; j < recentLocal.length; j++) { var same = false; try { same = await recentLocal[j].isSameEntry(hd); } catch (ex) { } if (!same) { keep.push(recentLocal[j]); } }
+                recentLocal = keep;
+                var f = await localFavIndex(hd);
+                if (f >= 0) { favLocal.splice(f, 1); }
+            }
+            idbSet('recent', recentLocal); idbSet('favorites', favLocal);
+            renderDrives(panes[0]); renderDrives(panes[1]);
+            loadLocal(p, []);
+        }
+
+        function updateFavButton(p) {
+            var b = p.el.fav;
+            if (!b) return;
+            function set(on, enabled) { b.innerHTML = on ? '&#x2605;' : '&#x2606;'; b.classList.toggle('fc-on', on); b.disabled = !enabled; b.title = on ? 'Remove this folder from favorites' : 'Add this folder to favorites'; }
+            if (p.type == 'remote') { set(remoteFavIndex(p.segs) >= 0, p.segs.length > 0); return; }
+            if (p.stack.length == 0) { set(false, false); return; }
+            var hd = p.stack[p.stack.length - 1];
+            localFavIndex(hd).then(function (i) { if (p.stack[p.stack.length - 1] === hd) { set(i >= 0, true); } });
+        }
+
+        // Common folders offered for devices, next to the user's favorites
+        function commonRemote() {
+            if (host.isWindows()) return [['C:', 'Users'], ['C:', 'Users', 'Public', 'Desktop'], ['C:', 'ProgramData'], ['C:', 'Program Files'], ['C:', 'Windows', 'Temp']];
+            return [['home'], ['root'], ['tmp'], ['var', 'log'], ['etc']];
         }
 
         function setPaneType(p, type) {
@@ -428,7 +521,7 @@ var FileCommander = (function () {
             renderDrives(p);
             saveState();
             if (type == 'remote') { loadRemote(p, p.segs || []); }
-            else if (p.stack.length > 0) { loadLocal(p, p.stack); }
+            else { loadLocal(p, p.stack); }
         }
 
         //
@@ -487,9 +580,10 @@ var FileCommander = (function () {
                 e.drives = h('select', 'fc-drives');
                 e.drives.title = 'Drives and folders';
                 e.up = h('button', 'fc-btn', '&#x2191;'); e.up.title = 'Parent folder (Backspace)';
-                e.rootBtn = h('button', 'fc-btn', '\\'); e.rootBtn.title = 'Root';
+                e.rootBtn = h('button', 'fc-btn', '\\'); e.rootBtn.title = 'Top level: drives on the device, your folders on this computer';
                 e.refresh = h('button', 'fc-btn', '&#x21bb;'); e.refresh.title = 'Refresh (Ctrl+R)';
-                e.head.append(e.src, e.drives, e.up, e.rootBtn, e.refresh);
+                e.fav = h('button', 'fc-btn fc-fav', '&#x2606;');
+                e.head.append(e.src, e.drives, e.up, e.rootBtn, e.refresh, e.fav);
                 e.path = h('input', 'fc-path'); e.path.type = 'text'; e.path.spellcheck = false; e.path.title = 'Type a path and press Enter';
                 e.scroll = h('div', 'fc-scroll'); e.scroll.tabIndex = 0;
                 e.table = h('table', 'fc-table');
@@ -519,27 +613,30 @@ var FileCommander = (function () {
         }
 
         function renderDrives(p) {
-            var e = p.el, x = '';
+            var e = p.el, x = '<option value=":go" hidden>Go to...</option>', sel = ':go';
+            function group(label, list) { if (list.length > 0) { x += '<optgroup label="' + esc(label) + '">' + list.join('') + '</optgroup>'; } }
+            function opt(v, t) { return '<option value="' + esc(v) + '">' + esc(t) + '</option>'; }
             if (p.type == 'remote') {
-                if (host.isWindows()) {
-                    x += '<option value=":root">Computer</option>';
-                    (remoteDrives || []).forEach(function (d) { x += '<option value="' + esc(d.name) + '">' + esc(d.name) + ' ' + esc(fileType(d)) + '</option>'; });
-                    e.drives.innerHTML = x;
-                    e.drives.value = (p.segs.length == 0) ? ':root' : p.segs[0];
-                    if (e.drives.selectedIndex < 0) { e.drives.value = ':root'; }
-                } else {
-                    e.drives.innerHTML = '<option value=":root">/</option>';
-                }
-                e.drives.style.display = host.isWindows() ? '' : 'none';
+                var w = host.isWindows();
+                x += opt(':root', w ? 'Computer' : '/');
+                if (w) { (remoteDrives || []).forEach(function (d) { x += opt('d:' + d.name, d.name + ' ' + fileType(d)); }); }
+                var favs = [];
+                favRemote.forEach(function (f, i) { if (f.w == w) { favs.push(opt('fav:' + i, '\u2605 ' + rDisplay(f.segs))); } });
+                group('Favorites', favs);
+                group('Common locations', commonRemote().map(function (c, i) { return opt('com:' + i, rDisplay(c)); }));
+                if (p.segs.length == 0) { sel = ':root'; }
+                else if (w && (p.segs.length == 1)) { sel = 'd:' + p.segs[0]; }
             } else {
-                recentLocal.forEach(function (hd, i) { x += '<option value="' + i + '">' + esc(hd.name) + '</option>'; });
-                x += '<option value=":pick">Choose folder...</option>';
-                e.drives.innerHTML = x;
-                var cur = -1;
-                if (p.stack.length > 0) { for (var i = 0; i < recentLocal.length; i++) { if (recentLocal[i] === p.stack[0]) { cur = i; } } }
-                e.drives.value = (cur >= 0) ? String(cur) : ':pick';
-                e.drives.style.display = '';
+                x += opt(':root', 'This computer');
+                group('Favorites', favLocal.map(function (hd, i) { return opt('f:' + i, '\u2605 ' + hd.name); }));
+                group('Recent', recentLocal.map(function (hd, i) { return opt('r:' + i, hd.name); }));
+                x += opt(':pick', 'Browse for a folder...');
+                if (p.stack.length == 0) { sel = ':root'; }
             }
+            e.drives.innerHTML = x;
+            e.drives.value = sel;
+            if (e.drives.selectedIndex < 0) { e.drives.value = ':go'; }
+            e.drives.style.display = '';
         }
 
         function renderPath(p) { p.el.path.value = paneLabel(p); }
@@ -548,7 +645,11 @@ var FileCommander = (function () {
             var cls = 'fc-row';
             if (p.marked[row.name] && !row.up) { cls += ' fc-marked'; }
             if (i == p.cursor) { cls += ' fc-cursor'; }
-            if (row.up) { return '<tr class="' + cls + '" data-i=' + i + '><td class=fc-name><span class="fc-icon fileIcon2"></span>..</td><td class=fc-r></td><td>Up</td><td></td></tr>'; }
+            if (row.up) { return '<tr class="' + cls + '" data-i=' + i + ' title="Double-click to go up a folder"><td class=fc-name><span class="fc-icon fileIcon2"></span>..</td><td class=fc-r></td><td>Up</td><td></td></tr>'; }
+            if ((row.kind == 'place') || (row.kind == 'browse') || (row.kind == 'dlplace')) {
+                var t = (row.kind == 'browse') ? 'Pick a folder on this computer' : ((row.kind == 'dlplace') ? 'Device files copied here are saved by the browser to your Downloads folder' : 'Double-click to open');
+                return '<tr class="' + cls + ' fc-place" data-i=' + i + ' title="' + esc(t) + '"><td class=fc-name><span class="fc-icon fileIcon' + ((row.kind == 'place') ? 2 : 1) + '"></span>' + (row.fav ? '&#x2605; ' : '') + esc(row.name) + '</td><td class=fc-r></td><td>' + esc(fileType(row)) + '</td><td></td></tr>';
+            }
             var icon = (row.kind == 'drive') ? ((row.dt == 'REMOVABLE') ? 5 : ((row.dt == 'CDROM') ? 6 : 1)) : ((row.kind == 'dir') ? 2 : 3);
             var size = (row.kind == 'file') ? sizeStr(row.size) : ((row.kind == 'drive') && row.size ? (sizeStr(row.free) + ' free') : '');
             var date = (row.date != null) ? esc(host.formatDate(new Date(row.date))) : '';
@@ -585,23 +686,19 @@ var FileCommander = (function () {
             renderSrc(p);
             renderDrives(p);
             renderPath(p);
-            var e = p.el, msg = '';
+            var e = p.el, msg = '', hint = '';
             if (p.message) { msg = esc(p.message); }
-            else if ((p.type == 'local') && (p.stack.length == 0)) {
-                if (!localSupported) { msg = 'This browser cannot open folders on this computer. Use Chrome or Edge, or drag files from your desktop onto the device pane.'; }
-                else {
-                    msg = '<button class="fc-btn fc-primary fc-pick">Choose a folder on this computer</button>';
-                    if (recentLocal.length > 0) { msg += '<div class=fc-recent>Recent: ' + recentLocal.map(function (hd, i) { return '<button class="fc-btn fc-reopen" data-i=' + i + '>' + esc(hd.name) + '</button>'; }).join(' ') + '</div>'; }
-                    msg += '<div class=fc-hint>The folder stays on this computer. Files are copied to and from the device through this browser.</div>';
-                }
+            else if ((p.type == 'local') && !localSupported) { msg = 'This browser cannot open folders on this computer. Use Chrome or Edge, or drag files from your desktop onto the device pane.'; }
+            else if (localRoot(p)) {
+                hint = '<b>Browsers cannot list drives.</b> Use "Browse for a folder..." and the folder is kept here. Chrome blocks drive roots such as C:\\, your user folder and Downloads itself, so pick a folder inside them (for example Downloads\\Mesh). ' +
+                    'To save device files to Downloads, copy or drag them onto "Downloads (save with the browser)". Use the &#x2606; button to add favorites.';
             }
-            e.empty.innerHTML = msg;
-            e.empty.style.display = msg ? '' : 'none';
+            e.empty.innerHTML = msg || hint;
+            e.empty.style.display = (msg || hint) ? '' : 'none';
+            e.empty.classList.toggle('fc-hint', !!hint);
             e.table.style.display = msg ? 'none' : '';
-            var pick = e.empty.querySelector('.fc-pick');
-            if (pick) { pick.onclick = function () { chooseLocalFolder(p); }; }
-            Array.prototype.forEach.call(e.empty.querySelectorAll('.fc-reopen'), function (b) { b.onclick = function () { chooseLocalFolder(p, recentLocal[parseInt(b.getAttribute('data-i'))]); }; });
-            e.path.disabled = (p.type == 'local') && (p.stack.length == 0);
+            e.path.disabled = localRoot(p);
+            updateFavButton(p);
             renderRows(p);
             fit();
         }
@@ -614,6 +711,7 @@ var FileCommander = (function () {
             });
             var s = '';
             if (p.loading) { s = 'Loading...'; }
+            else if (localRoot(p)) { s = 'This computer \u2014 double-click a folder to open it'; }
             else if (p.items.length > 0) {
                 s = dirs + ' folder' + (dirs == 1 ? '' : 's') + ', ' + filesCount + ' file' + (filesCount == 1 ? '' : 's') + ' (' + sizeStr(bytes) + ')';
                 if (sel > 0) { s = sel + ' selected (' + sizeStr(selBytes) + ') of ' + s; }
@@ -644,13 +742,13 @@ var FileCommander = (function () {
         }
 
         var keyDefs = [
-            { k: 'F2', t: 'Rename', f: function () { renameCmd(); }, en: function (p) { return selectedRows(p).length == 1; } },
+            { k: 'F2', t: 'Rename', f: function () { renameCmd(); }, en: function (p) { var s = selectedRows(p); return (s.length == 1) && isEntry(s[0]) && canWrite(p); } },
             { k: 'F3', t: 'Download', f: function () { downloadToBrowser(activePane()); }, en: function (p) { return (p.type == 'remote') && selectedRows(p).some(function (x) { return x.kind == 'file'; }); } },
             { k: 'F4', t: 'Edit', f: function () { editCmd(); }, en: function (p) { var s = selectedRows(p); return (s.length == 1) && (s[0].kind == 'file'); } },
             { k: 'F5', t: 'Copy', f: function () { copyCmd(false); }, en: function (p) { return canTransfer(p); } },
             { k: 'F6', t: 'Move', f: function () { copyCmd(true); }, en: function (p) { return canTransfer(p); } },
             { k: 'F7', t: 'New Folder', f: function () { mkdirCmd(); }, en: function (p) { return canWrite(p); } },
-            { k: 'F8', t: 'Delete', f: function () { deleteCmd(); }, en: function (p) { return canWrite(p) && selectedRows(p).length > 0; } },
+            { k: 'F8', t: 'Delete', f: function () { deleteCmd(); }, en: function (p) { return canWrite(p) && selectedRows(p).some(isEntry); } },
             { k: 'S-F4', t: 'New File', f: function () { mkfileCmd(); }, en: function (p) { return canWrite(p); } },
             { k: '', t: 'Upload', f: function () { uploadPickCmd(); }, en: function (p) { return (p.type == 'remote') && canWrite(p); } },
             { k: '', t: 'Zip', f: function () { zipCmd(); }, en: function (p) { return (p.type == 'remote') && !host.isSftp() && canWrite(p) && selectedRows(p).length > 0; } },
@@ -663,8 +761,10 @@ var FileCommander = (function () {
             return connected() && (!host.isWindows() || (p.segs.length > 0)); // The Windows root only lists drives
         }
         function canTransfer(p) {
-            var o = other(p);
-            if (selectedRows(p).length == 0 || !canWrite(o)) return false;
+            var o = other(p), rows = selectedRows(p).filter(isEntry);
+            if (rows.length == 0) return false;
+            if (localRoot(o)) return (p.type == 'remote') && rows.some(function (r) { return r.kind == 'file'; }); // Saved as browser downloads
+            if (!canWrite(o)) return false;
             if ((p.type == 'remote') && (o.type == 'remote') && host.isSftp()) return false;
             return true;
         }
@@ -691,11 +791,22 @@ var FileCommander = (function () {
             e.pane.addEventListener('mousedown', function () { if (activeIdx != p.idx) { setActive(p.idx); } });
             e.src.onchange = function () { setPaneType(p, e.src.value); };
             e.drives.onchange = function () {
-                var v = e.drives.value;
-                if (p.type == 'remote') { loadRemote(p, (v == ':root') ? [] : [v]); }
-                else if (v == ':pick') { chooseLocalFolder(p); }
-                else { chooseLocalFolder(p, recentLocal[parseInt(v)]); }
+                var v = e.drives.value, n = parseInt(v.split(':')[1]);
+                if (p.type == 'remote') {
+                    if (v == ':root') { loadRemote(p, []); }
+                    else if (v.indexOf('d:') == 0) { loadRemote(p, [v.substring(2)]); }
+                    else if ((v.indexOf('fav:') == 0) && favRemote[n]) { loadRemote(p, favRemote[n].segs.slice()); }
+                    else if (v.indexOf('com:') == 0) { loadRemote(p, commonRemote()[n]); }
+                } else {
+                    if (v == ':root') { loadLocal(p, []); }
+                    else if (v == ':pick') { chooseLocalFolder(p); }
+                    else if (v.indexOf('f:') == 0) { chooseLocalFolder(p, favLocal[n]); }
+                    else if (v.indexOf('r:') == 0) { chooseLocalFolder(p, recentLocal[n]); }
+                }
+                renderDrives(p);
+                e.scroll.focus();
             };
+            e.fav.onclick = function () { toggleFavorite(p, null); };
             e.up.onclick = function () { goUp(p); };
             e.rootBtn.onclick = function () { goRoot(p); };
             e.refresh.onclick = function () { refresh(p); };
@@ -744,21 +855,45 @@ var FileCommander = (function () {
                 ev.dataTransfer.setData('text/plain', selectedRows(p).map(function (r) { return r.name; }).join('\n'));
             });
             e.tbody.addEventListener('dragend', function () { dragSource = null; });
-            e.pane.addEventListener('dragover', function (ev) {
-                if ((dragSource === p) || !canWrite(p)) return;
-                if ((dragSource == null) && !(ev.dataTransfer && Array.prototype.indexOf.call(ev.dataTransfer.types, 'Files') >= 0)) return;
-                ev.preventDefault(); ev.stopPropagation();
-                ev.dataTransfer.dropEffect = (dragSource && ev.shiftKey) ? 'move' : 'copy';
-                e.pane.classList.add('fc-drop');
-            });
-            e.pane.addEventListener('dragleave', function (ev) { if (!e.pane.contains(ev.relatedTarget)) { e.pane.classList.remove('fc-drop'); } });
-            e.pane.addEventListener('drop', function (ev) {
+            function clearDrop() {
                 e.pane.classList.remove('fc-drop');
-                if ((dragSource === p) || !canWrite(p)) return;
+                if (p.dropTr) { p.dropTr.classList.remove('fc-droprow'); p.dropTr = null; }
+            }
+            // Moves within a pane, copies between panes. Ctrl forces a copy, Shift a move.
+            function dropMove(ev) { return ev.ctrlKey ? false : (ev.shiftKey ? true : (dragSource === p)); }
+            e.pane.addEventListener('dragover', function (ev) {
+                if ((dragSource == null) && !(ev.dataTransfer && Array.prototype.indexOf.call(ev.dataTransfer.types, 'Files') >= 0)) return;
+                var t = dropTarget(p, ev);
+                if (t == null) { clearDrop(); return; }
                 ev.preventDefault(); ev.stopPropagation();
-                if (dragSource != null) { var src = dragSource; dragSource = null; setActive(src.idx); copyCmd(ev.shiftKey); return; }
-                dropFromDesktop(p, ev.dataTransfer);
+                ev.dataTransfer.dropEffect = (dragSource && dropMove(ev) && !t.toBrowser) ? 'move' : 'copy';
+                if (p.dropTr !== t.tr) { clearDrop(); }
+                if (t.tr) { t.tr.classList.add('fc-droprow'); p.dropTr = t.tr; } else { e.pane.classList.add('fc-drop'); }
             });
+            e.pane.addEventListener('dragleave', function (ev) { if (!e.pane.contains(ev.relatedTarget)) { clearDrop(); } });
+            e.pane.addEventListener('drop', function (ev) {
+                var t = dropTarget(p, ev);
+                clearDrop();
+                if (t == null) return;
+                ev.preventDefault(); ev.stopPropagation();
+                if (dragSource != null) { var src = dragSource, move = dropMove(ev); dragSource = null; setActive(src.idx); transfer(src, selectedRows(src), p, t.row, move); return; }
+                dropFromDesktop(p, ev.dataTransfer, t.row);
+            });
+        }
+
+        // Where a drag over pane p would land: { row, tr } for a folder row, { row: null } for the folder
+        // the pane shows, { toBrowser } for browser downloads, or null when it cannot be dropped there.
+        function dropTarget(p, ev) {
+            var tr = (ev.target && ev.target.closest) ? ev.target.closest('tr.fc-row') : null;
+            var row = (tr && p.el.tbody.contains(tr)) ? p.rows[parseInt(tr.getAttribute('data-i'))] : null;
+            var fromRemote = (dragSource != null) && (dragSource.type == 'remote');
+            if (localRoot(p)) {
+                if (!fromRemote) return null;
+                return { row: null, tr: (row && (row.kind == 'dlplace')) ? tr : null, toBrowser: true };
+            }
+            if (row && !row.up && ((row.kind == 'dir') || ((row.kind == 'drive') && connected())) && !((dragSource === p) && p.marked[row.name])) { return { row: row, tr: tr }; }
+            if ((dragSource === p) || !canWrite(p)) return null;
+            return { row: null, tr: null };
         }
 
         function wireSplitter(panesEl) {
@@ -792,6 +927,7 @@ var FileCommander = (function () {
             else if ((k == ' ') || (k == 'Insert')) { toggleMark(p, p.cursor); setCursor(p, p.cursor + 1); }
             else if ((k == 'a' || k == 'A') && (ev.ctrlKey || ev.metaKey)) { p.marked = {}; p.rows.forEach(function (r) { if (!r.up) { p.marked[r.name] = 1; } }); renderMarks(p); }
             else if ((k == 'r' || k == 'R') && (ev.ctrlKey || ev.metaKey)) { refresh(p); }
+            else if ((k == 'Escape') && job) { cancelJob(job); }
             else if (k == 'Escape') { p.marked = {}; renderMarks(p); }
             else if (k == 'F2') { renameCmd(); }
             else if (k == 'F3') { downloadToBrowser(p); }
@@ -811,11 +947,17 @@ var FileCommander = (function () {
 
         function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
 
-        function showMenu(p, x, y) {
+        async function showMenu(p, x, y) {
             closeMenu();
             var items = [];
             var row = p.rows[p.cursor], sel = selectedRows(p);
             if (row && (row.up || row.kind != 'file')) { items.push(['Open', function () { openRow(p, row); }]); }
+            var folder = (sel.length == 1) && ((sel[0].kind == 'dir') || (sel[0].kind == 'place')) ? sel[0] : null;
+            if (folder) {
+                var isFav = (p.type == 'remote') ? (remoteFavIndex(p.segs.concat([folder.name])) >= 0) : ((await localFavIndex(folder.handle)) >= 0);
+                items.push([isFav ? 'Remove from favorites' : 'Add to favorites', function () { toggleFavorite(p, folder); }]);
+            }
+            if (sel.some(function (r) { return r.kind == 'place'; })) { items.push(['Remove from this list', function () { removePlaces(p, sel); }]); }
             keyDefs.forEach(function (d) { if ((d.t != 'Refresh') && d.en(p)) { items.push([d.t + (((d.t == 'Copy') || (d.t == 'Move')) ? (p.idx == 0 ? ' →' : ' ←') : ''), d.f]); } });
             if ((p.type == 'remote') && !host.isSftp() && (sel.length == 1) && host.openOnDevice) {
                 items.push(['Open on device desktop', async function () {
@@ -824,7 +966,7 @@ var FileCommander = (function () {
                     host.openOnDevice(host.isWindows() ? path.replace(/\//g, '\\') : path, sel[0].kind != 'file');
                 }]);
             }
-            if (sel.length > 0) { items.push(['Copy path', function () { copyPaths(p, sel); }]); }
+            if (sel.some(isEntry)) { items.push(['Copy path', function () { copyPaths(p, sel.filter(isEntry)); }]); }
             items.push(['Select all', function () { p.marked = {}; p.rows.forEach(function (r) { if (!r.up) { p.marked[r.name] = 1; } }); renderMarks(p); }]);
             items.push(['Refresh', function () { refresh(p); }]);
             menuEl = h('div', 'fc-menu');
@@ -926,7 +1068,7 @@ var FileCommander = (function () {
 
         async function renameCmd() {
             var p = activePane(), sel = selectedRows(p);
-            if ((sel.length != 1) || (sel[0].kind == 'drive') || busyCheck()) return;
+            if ((sel.length != 1) || !isEntry(sel[0]) || !canWrite(p) || busyCheck()) return;
             var item = sel[0];
             var r = await modal('Rename', 'New name for ' + esc(item.name), [['Rename', 'ok', true], ['Cancel', null]], { value: item.name, selectStem: (item.kind == 'file') });
             if ((r.value != 'ok') || (r.text == item.name)) return;
@@ -941,7 +1083,9 @@ var FileCommander = (function () {
         }
 
         async function deleteCmd() {
-            var p = activePane(), sel = selectedRows(p).filter(function (x) { return x.kind != 'drive'; });
+            var p = activePane();
+            if (localRoot(p)) { removePlaces(p, selectedRows(p)); return; }
+            var sel = selectedRows(p).filter(isEntry);
             if ((sel.length == 0) || !canWrite(p) || busyCheck()) return;
             var dirs = sel.filter(function (x) { return x.kind == 'dir'; }).length;
             var msg = (sel.length == 1) ? ('Delete <b>' + esc(sel[0].name) + '</b>' + (dirs ? ' and everything in it' : '') + '?') : ('Delete ' + sel.length + ' items' + (dirs ? ', including ' + dirs + ' folder' + (dirs > 1 ? 's' : '') + ' and everything in them' : '') + '?');
@@ -1008,7 +1152,7 @@ var FileCommander = (function () {
             if ((p.type != 'remote') || !canWrite(p) || busyCheck()) return;
             var inp = document.createElement('input');
             inp.type = 'file'; inp.multiple = true;
-            inp.onchange = function () { if (inp.files.length > 0) { startCopy(Array.prototype.map.call(inp.files, fileSource), p, false, 'Upload'); } };
+            inp.onchange = function () { if (inp.files.length > 0) { startCopy(Array.prototype.map.call(inp.files, fileSource), destInfo(p, null), false, 'Upload', null, p); } };
             inp.click();
         }
 
@@ -1111,8 +1255,11 @@ var FileCommander = (function () {
                 mkdir: async function (name) { return localDest(await dir.getDirectoryHandle(name, { create: true })); },
                 writeFile: async function (name, src, onProgress) {
                     if (src.remote) {
+                        var existed = true;
+                        try { await dir.getFileHandle(name); } catch (ex) { existed = false; }
                         var sink = await localSink(dir, name);
-                        await rDownload(joinRemote(src.remote.segs, name), src.size, sink, onProgress);
+                        try { await rDownload(joinRemote(src.remote.segs, name), src.size, sink, onProgress); }
+                        catch (ex) { await sink.abort(); if (!existed) { try { await dir.removeEntry(name); } catch (e2) { } } throw ex; } // Don't leave an empty file behind
                         return false;
                     }
                     var file = await src.getFile();
@@ -1125,7 +1272,36 @@ var FileCommander = (function () {
             };
         }
 
-        function destFor(p) { return (p.type == 'remote') ? remoteDest(p.segs.slice()) : localDest(p.stack[p.stack.length - 1]); }
+        // Device files saved through the browser, landing in its Downloads folder
+        function browserDest() {
+            return {
+                label: 'Downloads folder (browser downloads)',
+                names: function () { return Promise.resolve([]); },
+                mkdir: function () { return Promise.reject(new Error('Folders cannot be saved as browser downloads. Open a folder on this computer instead.')); },
+                writeFile: async function (name, src, onProgress) {
+                    if (!src.remote) throw new Error('Only device files can be saved as browser downloads');
+                    var path = joinRemote(src.remote.segs, name);
+                    var url = host.downloadUrl ? host.downloadUrl(path, name) : null;
+                    if (url) { host.downloadFile(url, name); if (onProgress) { onProgress(src.size, src.size); } return false; }
+                    var chunks = [];
+                    var sink = { write: function (b) { chunks.push(b); return Promise.resolve(); }, close: function () { return Promise.resolve(); }, abort: function () { chunks = []; } };
+                    await rDownload(path, src.size, sink, onProgress);
+                    if (typeof saveAs == 'function') { saveAs(new Blob(chunks), name); }
+                    return false;
+                }
+            };
+        }
+
+        // Destination for pane o, or for the folder row in it: { dest, label, segs | handle | toBrowser }
+        function destInfo(o, row) {
+            if (o.type == 'remote') {
+                var segs = o.segs.concat(row ? [row.name] : []);
+                return { dest: remoteDest(segs), label: host.nodeName() + ': ' + rDisplay(segs), segs: segs };
+            }
+            if (o.stack.length == 0) { return { dest: browserDest(), label: 'Your Downloads folder (browser downloads)', toBrowser: true }; }
+            var hd = row ? row.handle : o.stack[o.stack.length - 1];
+            return { dest: localDest(hd), label: 'This computer: ' + paneLabel(o) + (row ? row.name + '\\' : ''), handle: hd };
+        }
 
         function sourcesFor(p, rows) {
             if (p.type == 'remote') { var segs = p.segs.slice(); return rows.map(function (r) { return remoteSource(segs, r); }); }
@@ -1133,26 +1309,41 @@ var FileCommander = (function () {
             return rows.map(function (r) { return handleSource(r.handle, parent, r.size); });
         }
 
-        async function copyCmd(move) {
-            var p = activePane(), o = other(p);
-            var rows = selectedRows(p).filter(function (x) { return x.kind != 'drive'; });
-            if ((rows.length == 0) || !canTransfer(p) || busyCheck()) return;
-            if ((p.type == o.type) && (paneLabel(p) == paneLabel(o)) && ((p.type == 'remote') || (p.stack[p.stack.length - 1] === o.stack[o.stack.length - 1]))) { alertBox(move ? 'Move' : 'Copy', 'The source and destination folders are the same.'); return; }
-            if ((p.type == 'remote') && (o.type == 'remote')) {
-                var dst = rPath(o.segs).toLowerCase();
-                for (var i = 0; i < rows.length; i++) {
-                    if ((rows[i].kind == 'dir') && ((dst + '/').indexOf(rPath(p.segs.concat([rows[i].name])).toLowerCase() + '/') == 0)) { alertBox(move ? 'Move' : 'Copy', 'A folder cannot be copied into itself.'); return; }
-                }
+        function copyCmd(move) { var p = activePane(); return transfer(p, selectedRows(p), other(p), null, move); }
+
+        // Copy or move rows of pane p into pane o, or into the folder row dstRow of pane o
+        async function transfer(p, rows, o, dstRow, move) {
+            rows = rows.filter(isEntry);
+            if ((rows.length == 0) || busyCheck() || !connected() && ((p.type == 'remote') || (o.type == 'remote'))) return;
+            var t = destInfo(o, dstRow), verb = move ? 'Move' : 'Copy';
+            if (t.toBrowser) {
+                if (p.type != 'remote') return;
+                var dirs = rows.filter(function (r) { return r.kind == 'dir'; });
+                rows = rows.filter(function (r) { return r.kind == 'file'; });
+                if (rows.length == 0) { alertBox('Download', 'Folders cannot be saved as browser downloads. Open a folder on this computer, or zip the folder on the device first.'); return; }
+                if (dirs.length > 0) { flash(p, dirs.length + ' folder' + (dirs.length > 1 ? 's' : '') + ' skipped'); }
+                move = false; verb = 'Download';
             }
-            var verb = move ? 'Move' : 'Copy';
+            if ((p.type == 'remote') && (o.type == 'remote')) {
+                var dst = rPath(t.segs).toLowerCase() + '/';
+                if (dst == rPath(p.segs).toLowerCase() + '/') { alertBox(verb, 'The source and destination folders are the same.'); return; }
+                for (var i = 0; i < rows.length; i++) {
+                    if ((rows[i].kind == 'dir') && (dst.indexOf(rPath(p.segs.concat([rows[i].name])).toLowerCase() + '/') == 0)) { alertBox(verb, 'A folder cannot be copied into itself.'); return; }
+                }
+            } else if ((p.type == 'local') && (o.type == 'local') && t.handle) {
+                var same = false;
+                try { same = await p.stack[p.stack.length - 1].isSameEntry(t.handle); } catch (ex) { }
+                if (same) { alertBox(verb, 'The source and destination folders are the same.'); return; }
+            }
             var what = (rows.length == 1) ? ('<b>' + esc(rows[0].name) + '</b>') : (rows.length + ' items');
-            var msg = verb + ' ' + what + ' to<div class=fc-where>' + esc(o.type == 'remote' ? (host.nodeName() + ': ' + paneLabel(o)) : ('This computer: ' + paneLabel(o))) + '</div>';
+            var msg = verb + ' ' + what + ' to<div class=fc-where>' + esc(t.label) + '</div>';
             if ((await modal(verb, msg, [[verb, true, true], ['Cancel', false]])) !== true) return;
-            startCopy(sourcesFor(p, rows), o, move, verb, p);
+            startCopy(sourcesFor(p, rows), t, move, verb, p, o);
         }
 
-        async function dropFromDesktop(p, dt) {
-            if (busyCheck()) return;
+        async function dropFromDesktop(p, dt, row) {
+            var t = destInfo(p, row);
+            if (t.toBrowser || busyCheck()) return;
             var sources = [], items = dt.items ? Array.prototype.slice.call(dt.items) : [];
             var handles = items.filter(function (it) { return it.kind == 'file'; });
             if ((handles.length > 0) && (typeof handles[0].getAsFileSystemHandle == 'function')) {
@@ -1164,18 +1355,19 @@ var FileCommander = (function () {
                 Array.prototype.forEach.call(dt.files || [], function (f) { sources.push(fileSource(f)); });
             }
             if (sources.length == 0) return;
-            startCopy(sources, p, false, 'Upload');
+            startCopy(sources, t, false, 'Upload', null, p);
         }
 
-        function startCopy(sources, destPane, move, verb, srcPane) {
-            var dest = destFor(destPane);
-            runJob(move ? 'Moving' : (verb == 'Upload' ? 'Uploading' : 'Copying'), async function (j) {
+        function startCopy(sources, target, move, verb, srcPane, destPane) {
+            var title = { Upload: 'Uploading', Download: 'Downloading', Move: 'Moving' }[verb] || 'Copying';
+            runJob(title, async function (j) {
                 j.policy = null;
                 j.caseless = (destPane.type == 'remote') ? caseless() : true;
-                await copyInto(j, sources, dest, move);
+                await copyInto(j, sources, target.dest, move);
             }, function () {
-                refresh(destPane);
-                if (srcPane && move) { srcPane.marked = {}; refresh(srcPane); }
+                if (!target.toBrowser) { refresh(destPane); }
+                if (srcPane && move && (srcPane !== destPane)) { srcPane.marked = {}; refresh(srcPane); }
+                if (srcPane === destPane) { srcPane.marked = {}; }
             });
         }
 
@@ -1229,6 +1421,14 @@ var FileCommander = (function () {
             });
         }
 
+        function cancelJob(j) {
+            if ((j == null) || j.canceled) return;
+            j.canceled = true;
+            uploadCancel(); downloadCancel();
+            var b = obj.jobEl.querySelector('.fc-cancel');
+            if (b) { b.disabled = true; b.textContent = 'Canceling...'; }
+        }
+
         function renderJob(done, canceled) {
             var el = obj.jobEl, j = job || done;
             if (!el) return;
@@ -1236,10 +1436,17 @@ var FileCommander = (function () {
             el.style.display = '';
             clearTimeout(obj.jobTimer);
             if (job) {
-                var pct = (j.curSize > 0) ? Math.floor(j.curBytes * 100 / j.curSize) : 0;
-                el.innerHTML = '<div class=fc-job-text>' + esc(j.title) + ' <b>' + esc(j.current || '') + '</b> ' + (j.curSize > 0 ? pct + '% of ' + sizeStr(j.curSize) : '') + ' &mdash; ' + j.files + ' done' + (j.skipped ? ', ' + j.skipped + ' skipped' : '') + (j.errors.length ? ', ' + j.errors.length + ' failed' : '') + '</div><progress max=100 value=' + pct + '></progress><button class="fc-btn fc-cancel">Cancel</button>';
-                el.querySelector('.fc-cancel').onclick = function () { j.canceled = true; uploadCancel(); downloadCancel(); };
+                // Built once per job and then only updated, so the Cancel button stays clickable while progress changes
+                if (el.fcJob !== j) {
+                    el.fcJob = j;
+                    el.innerHTML = '<div class=fc-job-text></div><progress max=100 value=0></progress><button class="fc-btn fc-cancel" title="Cancel the transfer (Esc)">Cancel</button>';
+                    el.querySelector('.fc-cancel').onclick = function () { cancelJob(j); };
+                }
+                var pct = (j.curSize > 0) ? Math.min(100, Math.floor(j.curBytes * 100 / j.curSize)) : 0;
+                el.firstChild.innerHTML = esc(j.title) + ' <b>' + esc(j.current || '') + '</b> ' + (j.curSize > 0 ? pct + '% of ' + sizeStr(j.curSize) : '') + ' &mdash; ' + j.files + ' done' + (j.skipped ? ', ' + j.skipped + ' skipped' : '') + (j.errors.length ? ', ' + j.errors.length + ' failed' : '');
+                el.querySelector('progress').value = pct;
             } else {
+                el.fcJob = null;
                 var s = (canceled ? 'Canceled' : 'Done') + ': ' + j.files + ' file' + (j.files == 1 ? '' : 's') + ' (' + sizeStr(j.bytes) + ')' + (j.skipped ? ', ' + j.skipped + ' skipped' : '') + (j.errors.length ? ', ' + j.errors.length + ' failed' : '');
                 el.innerHTML = '<div class=fc-job-text' + (j.errors.length ? ' style=color:var(--fc-err)' : '') + '>' + esc(s) + '</div>' + (j.errors.length ? '<button class="fc-btn fc-details">Details</button>' : '') + '<button class="fc-btn fc-close">Close</button>';
                 el.querySelector('.fc-close').onclick = function () { el.style.display = 'none'; };
@@ -1339,7 +1546,7 @@ var FileCommander = (function () {
         obj.fit = fit;
 
         // Setup
-        var types = storeGet('fcTypes', [localSupported ? 'local' : 'remote', 'remote']);
+        var types = storeGet('fcTypes2', ['local', 'remote']);
         var sorts = storeGet('fcSort', null);
         for (var i = 0; i < 2; i++) {
             panes.push(newPane(i));
@@ -1355,8 +1562,16 @@ var FileCommander = (function () {
         document.addEventListener('mousedown', function (ev) { if (menuEl && !menuEl.contains(ev.target)) { closeMenu(); } });
         obj.keysEl.addEventListener('click', function (ev) { var b = ev.target.closest('.fc-key'); if (b) { keyDefs[parseInt(b.getAttribute('data-i'))].f(); } });
         if (localSupported) {
-            idbGet('recent').then(function (list) {
-                if (Array.isArray(list)) { recentLocal = list; panes.forEach(function (p) { if (p.type == 'local') { renderPane(p); } }); }
+            // Reopen the folder each local pane showed last time, when the browser still allows it without asking
+            Promise.all([idbGet('recent'), idbGet('favorites'), idbGet('last0'), idbGet('last1')]).then(async function (r) {
+                if (Array.isArray(r[0])) { recentLocal = r[0]; }
+                if (Array.isArray(r[1])) { favLocal = r[1]; }
+                for (var i = 0; i < 2; i++) {
+                    var p = panes[i], last = r[2 + i], ok = false;
+                    if (p.type != 'local') continue;
+                    if (last) { try { ok = (await last.queryPermission({ mode: 'readwrite' })) == 'granted'; } catch (ex) { } }
+                    if (p.stack.length == 0) { loadLocal(p, ok ? [last] : []); }
+                }
             });
         }
         if (storeGet('fcActive', false)) { setTimeout(function () { obj.setActive(true); }, 0); }
