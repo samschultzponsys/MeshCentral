@@ -31,6 +31,7 @@ var DEFAULT_PRINTER_NAME = 'MeshCentral Printer';
 var DEFAULT_TCP_PORT = 35500;
 var MAX_JOB_SIZE = 256 * 1024 * 1024;               // Larger jobs are dropped
 var MAX_JOB_AGE = 15 * 60 * 1000;                   // Jobs older than this are deleted
+var COMMAND_TIMEOUT = 2 * 60 * 1000;                // PowerShell or lpadmin commands are killed after this
 
 var sep = (process.platform == 'win32') ? '\\' : '/';
 var agentFolder = process.execPath.substring(0, process.execPath.lastIndexOf(sep));
@@ -124,32 +125,39 @@ function runNext() {
     try { func(runNext); } catch (ex) { runNext(); }
 }
 
-// Run a PowerShell script, callback(exitCode, output)
-function runPowerShell(script, func) {
-    var psPath = (process.env['SystemRoot'] || 'C:\\Windows') + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    var child = require('child_process').execFile(psPath, ['powershell', '-NoProfile', '-NoLogo', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'], {});
+// Collect the output of a child process, callback(exitCode, output). The child is killed if it runs too long,
+// so a stuck command can't block the operation queue.
+function watchChild(child, func) {
+    var done = false;
+    var finish = function (code, output) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        var i = children.indexOf(child); if (i >= 0) { children.splice(i, 1); }
+        func(code, output);
+    };
+    var timer = setTimeout(function () { try { child.kill(); } catch (ex) { } finish(-1, 'Timed out installing the printer'); }, COMMAND_TIMEOUT);
     children.push(child);
     child.stdout.str = ''; child.stderr.str = '';
     child.stdout.on('data', function (c) { this.str += c.toString(); });
     child.stderr.on('data', function (c) { this.str += c.toString(); });
-    child.on('exit', function (code) {
-        var i = children.indexOf(child); if (i >= 0) { children.splice(i, 1); }
-        func(code, (child.stdout.str + child.stderr.str).trim());
-    });
-    child.stdin.write(script + '\r\nexit $LASTEXITCODE\r\n');
+    child.on('exit', function (code) { finish(code, (child.stdout.str + child.stderr.str).trim()); });
+}
+
+// Run a PowerShell script, callback(exitCode, output). The script is passed with -EncodedCommand, when it's
+// written to stdin PowerShell waits for a blank line after multi-line statements like try/catch and never runs them.
+function runPowerShell(script, func) {
+    var psPath = (process.env['SystemRoot'] || 'C:\\Windows') + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    var encoded = Buffer.alloc(script.length * 2); // -EncodedCommand takes base64 of UTF-16LE
+    for (var i = 0; i < script.length; i++) { encoded.writeUInt16LE(script.charCodeAt(i), i * 2); }
+    var child = require('child_process').execFile(psPath, ['powershell', '-NoProfile', '-NoLogo', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded.toString('base64')], {});
+    watchChild(child, func);
+    try { child.stdin.end(); } catch (ex) { }
 }
 
 // Run a command without a shell, callback(exitCode, output)
 function runCommand(path, args, func) {
-    var child = require('child_process').execFile(path, args);
-    children.push(child);
-    child.stdout.str = ''; child.stderr.str = '';
-    child.stdout.on('data', function (c) { this.str += c.toString(); });
-    child.stderr.on('data', function (c) { this.str += c.toString(); });
-    child.on('exit', function (code) {
-        var i = children.indexOf(child); if (i >= 0) { children.splice(i, 1); }
-        func(code, (child.stdout.str + child.stderr.str).trim());
-    });
+    watchChild(require('child_process').execFile(path, args), func);
 }
 
 function readMarker() { try { return JSON.parse(fs.readFileSync(markerFile).toString()); } catch (ex) { return null; } }
@@ -164,7 +172,7 @@ function installPrinter(name, port, func) {
             "$ErrorActionPreference = 'Stop'",
             "try {",
             "  $name = " + psQuote(name) + "; $port = " + psQuote(portName) + "; $drv = 'Microsoft Print To PDF'",
-            "  if (-not (Get-PrinterDriver -Name $drv -ErrorAction SilentlyContinue)) { throw ('Printer driver not found: ' + $drv) }",
+            "  if (-not (Get-PrinterDriver -Name $drv -ErrorAction SilentlyContinue)) { throw ('Printer driver not found: ' + $drv + '. Turn on the \"Microsoft Print to PDF\" Windows feature, it is included in Windows 10 and later.') }",
             "  $existing = Get-Printer -Name $name -ErrorAction SilentlyContinue",
             "  if ($existing -and ($existing.PortName -notlike '" + PORT_PREFIX + "*')) { throw ('A printer with this name already exists: ' + $name) }",
             "  Get-Printer | Where-Object { ($_.PortName -like '" + PORT_PREFIX + "*') -and (($_.Name -ne $name) -or ($_.PortName -ne $port)) } | Remove-Printer",
