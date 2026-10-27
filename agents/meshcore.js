@@ -2533,40 +2533,62 @@ function getDirectoryInfo(reqpath) {
     return response;
 }
 
-// Find the folder for files dropped on the remote desktop. On Windows this is the Explorer window under the
-// drop point (x, y are pixels of the displayed screen), or the desktop itself. On macOS, the front Finder window.
-// Otherwise, the logged in user's Downloads folder. Calls func({ path, kind, error }), path is null if nothing was found
-// and error then says why.
-function getDropTarget(x, y, display, func) {
+// Find the folder for files dropped on the remote desktop. Mode 'downloads' or 'desktop' picks that folder of the
+// logged in user. Otherwise: on Windows the Explorer window under the drop point (x, y are pixels of the displayed
+// screen), the desktop itself, the foreground Explorer window, or the only open Explorer window; on macOS the front
+// Finder window; else the Downloads folder. Calls func({ path, kind, note, error }): note tells why the folder
+// under the drop point was not used, path is null if nothing was found and error then says why.
+function getDropTarget(x, y, display, mode, func) {
     var done = false;
-    function reply(path, kind, error) {
+    function reply(path, kind, note, error) {
         if (done) return;
         done = true;
         if ((typeof path == 'string') && (path.length > 1) && ((path.endsWith('/')) || (path.endsWith('\\') && (path.length > 3)))) { path = path.substring(0, path.length - 1); }
-        func({ path: path, kind: kind, error: error });
+        func({ path: path, kind: kind, note: note, error: error });
     }
     function b64(s) { try { return Buffer.from(s, 'base64').toString(); } catch (ex) { return null; } }
-    setTimeout(function () { reply(null, null, 'The folder lookup timed out'); }, 20000); // Give up if the helper hangs
+    // Pick the folder for the mode from the lookup results
+    function pick(folder, desktop, downloads, note) {
+        if (mode == 'desktop') { if (desktop) { reply(desktop, 'desktop'); return true; } }
+        else if (mode == 'downloads') { if (downloads) { reply(downloads, 'downloads'); return true; } }
+        else {
+            if (folder) { reply(folder, (folder == desktop) ? 'desktop' : 'folder'); return true; }
+            if (downloads) { reply(downloads, 'downloads', note); return true; }
+        }
+        return false;
+    }
+    setTimeout(function () { reply(null, null, null, 'The folder lookup timed out'); }, 20000); // Give up if the helper hangs
+    var find = ((mode != 'desktop') && (mode != 'downloads'));
     x = ((typeof x == 'number') && (x >= 0)) ? Math.floor(x) : -1;
     y = ((typeof y == 'number') && (y >= 0)) ? Math.floor(y) : -1;
     display = (typeof display == 'number') ? Math.floor(display) : 0;
     try {
         if (process.platform == 'win32') {
-            // Runs as the logged in user, prints base64 paths between \x02 and \x03: folder under the point, desktop folder, downloads folder
+            // Runs as the logged in user, prints base64 values between \x02 and \x03: folder for the drop, desktop folder, downloads folder, note
             var ps = [
                 "$ErrorActionPreference = 'SilentlyContinue'",
-                "$x = " + x + "; $y = " + y + "; $display = " + display,
-                "$folder = ''; $desktop = [Environment]::GetFolderPath('Desktop'); $downloads = ''",
+                "$x = " + x + "; $y = " + y + "; $display = " + display + "; $find = " + (find ? 1 : 0),
+                "$folder = ''; $note = ''; $desktop = [Environment]::GetFolderPath('Desktop'); $downloads = ''",
                 "$shell = New-Object -ComObject Shell.Application",
                 "try { $downloads = $shell.NameSpace('shell:Downloads').Self.Path } catch { }",
                 "if (-not $downloads) { $downloads = Join-Path $env:USERPROFILE 'Downloads' }",
-                "try {",
-                "Add-Type -TypeDefinition @'",
+                "function PathOf($w) { try { $p = $w.Document.Folder.Self.Path; if ($p -and (Test-Path -LiteralPath $p -PathType Container)) { return $p } } catch { }; return '' }",
+                // Explorer windows with this handle, one per tab on Windows 11. The title shows the active tab.
+                "function FolderOf($h) {",
+                "  $title = [MeshDropTarget]::Title($h); $wins = @()",
+                "  foreach ($w in $shell.Windows()) { try { if (($w.HWND -eq $h.ToInt64()) -and ($w.FullName -like '*explorer.exe')) { $wins += $w } } catch { } }",
+                "  foreach ($w in $wins) { if ($w.LocationName -and $title.StartsWith($w.LocationName)) { return (PathOf $w) } }",
+                "  if ($wins.Count -gt 0) { return (PathOf $wins[0]) }",
+                "  return ''",
+                "}",
+                "if ($find) {",
+                "  try {",
+                "Add-Type -ErrorAction Stop -TypeDefinition @'",
                 "using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;",
                 "public static class MeshDropTarget {",
                 "  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }",
                 "  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }",
-                "  public delegate bool MonitorProc(IntPtr m, IntPtr dc, ref RECT r, IntPtr d);",
+                "  public delegate bool MonitorProc(IntPtr m, IntPtr dc, ref RECT rc, IntPtr d);",
                 "  [DllImport(\"user32.dll\")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorProc proc, IntPtr d);",
                 "  [DllImport(\"user32.dll\")] static extern IntPtr WindowFromPoint(POINT p);",
                 "  [DllImport(\"user32.dll\")] static extern IntPtr GetAncestor(IntPtr h, uint flags);",
@@ -2579,33 +2601,34 @@ function getDropTarget(x, y, display, func) {
                 "  public static string ClassName(IntPtr h) { StringBuilder s = new StringBuilder(256); GetClassName(h, s, 256); return s.ToString(); }",
                 "  public static string Title(IntPtr h) { StringBuilder s = new StringBuilder(1024); GetWindowText(h, s, 1024); return s.ToString(); }",
                 "  public static IntPtr Foreground() { return GetAncestor(GetForegroundWindow(), 2); }",
+                "  public static int Monitors = 0;",
                 "  public static IntPtr AtPoint(int x, int y, int display) {",
                 "    try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (Exception) { SetProcessDPIAware(); }",
                 "    int ox = GetSystemMetrics(76), oy = GetSystemMetrics(77);", // Virtual screen origin, used when showing all displays
                 "    List<RECT> mons = new List<RECT>();",
-                "    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr m, IntPtr dc, ref RECT r, IntPtr d) { mons.Add(r); return true; }, IntPtr.Zero);",
-                "    if ((mons.Count == 1) || ((display > 0) && (display <= mons.Count))) { RECT r = mons[(mons.Count == 1) ? 0 : (display - 1)]; ox = r.Left; oy = r.Top; }",
+                "    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr m, IntPtr dc, ref RECT rc, IntPtr d) { mons.Add(rc); return true; }, IntPtr.Zero);",
+                "    Monitors = mons.Count;",
+                "    if ((mons.Count == 1) || ((display > 0) && (display <= mons.Count))) { RECT mon = mons[(mons.Count == 1) ? 0 : (display - 1)]; ox = mon.Left; oy = mon.Top; }",
                 "    POINT p; p.X = ox + x; p.Y = oy + y;",
                 "    return GetAncestor(WindowFromPoint(p), 2);", // GA_ROOT
                 "  }",
                 "}",
                 "'@",
-                "$h = [IntPtr]::Zero",
-                "if ($x -ge 0) { $h = [MeshDropTarget]::AtPoint($x, $y, $display) }",
-                "if ($h -eq [IntPtr]::Zero) { $h = [MeshDropTarget]::Foreground() }",
-                "$cls = [MeshDropTarget]::ClassName($h)",
-                "if (($cls -eq 'Progman') -or ($cls -eq 'WorkerW')) { $folder = $desktop } else {",
-                // Explorer windows with this handle, one per tab on Windows 11. The title shows the active tab.
-                "  $title = [MeshDropTarget]::Title($h); $wins = @()",
-                "  foreach ($w in $shell.Windows()) { if (($w.HWND -eq $h.ToInt64()) -and ($w.FullName -like '*explorer.exe')) { $wins += $w } }",
-                "  $pick = $null",
-                "  foreach ($w in $wins) { if ($w.LocationName -and $title.StartsWith($w.LocationName)) { $pick = $w; break } }",
-                "  if (($pick -eq $null) -and ($wins.Count -gt 0)) { $pick = $wins[0] }",
-                "  if ($pick -ne $null) { $p = $pick.Document.Folder.Self.Path; if ($p -and (Test-Path -LiteralPath $p -PathType Container)) { $folder = $p } }",
+                "    $h = [IntPtr]::Zero",
+                "    if ($x -ge 0) { $h = [MeshDropTarget]::AtPoint($x, $y, $display) }",
+                "    $cls = ''; if ($h -ne [IntPtr]::Zero) { $cls = [MeshDropTarget]::ClassName($h) }",
+                "    $note = 'window at ' + $x + ',' + $y + ' (display ' + $display + ' of ' + [MeshDropTarget]::Monitors + '): ' + $cls",
+                "    if (($cls -eq 'Progman') -or ($cls -eq 'WorkerW')) { $folder = $desktop } elseif ($h -ne [IntPtr]::Zero) { $folder = FolderOf $h }",
+                "    if (-not $folder) { $f = [MeshDropTarget]::Foreground(); if ($f -ne [IntPtr]::Zero) { $folder = FolderOf $f; $note += ', foreground: ' + [MeshDropTarget]::ClassName($f) } }",
+                "  } catch { $note = 'window lookup failed: ' + $_.Exception.Message }",
+                // Without a window: use the only open Explorer folder window, if there is exactly one
+                "  if (-not $folder) {",
+                "    $open = @(); foreach ($w in $shell.Windows()) { try { if ($w.FullName -like '*explorer.exe') { $p = PathOf $w; if ($p -and ($open -notcontains $p)) { $open += $p } } } catch { } }",
+                "    if ($open.Count -eq 1) { $folder = $open[0] } else { $note += ', open folder windows: ' + $open.Count }",
+                "  }",
                 "}",
-                "} catch { }",
                 "function B64($s) { if (-not $s) { return '' }; return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }",
-                "[Console]::Out.Write(([string][char]2) + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + ([string][char]3))", // Start from a string, [char] + string is not a concatenation
+                "[Console]::Out.Write(([string][char]2) + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + '|' + (B64 $note) + ([string][char]3))", // Start from a string, [char] + string is not a concatenation
                 "[Console]::Out.Flush()"
             ].join('\r\n');
             var u = Buffer.alloc(ps.length * 2); // -EncodedCommand takes UTF-16LE in base64
@@ -2620,18 +2643,17 @@ function getDropTarget(x, y, display, func) {
             child.on('exit', function (code) {
                 var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
                 var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
-                var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null;
-                if (folder) { reply(folder, (folder == desktop) ? 'desktop' : 'folder'); return; }
+                var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null, note = v[3] ? b64(v[3]) : null;
                 if (!downloads) { downloads = getWindowsDownloadsFolder(); }
-                if (downloads) { reply(downloads, 'downloads'); return; }
+                if (pick(folder, desktop, downloads, note)) return;
                 var err = (child.stderr.str + ' ' + child.stdout.str).trim().substring(0, 300);
-                reply(null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
+                reply(null, null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
             });
         } else if (process.platform == 'darwin') {
             // Ask Finder for its front window, run as the console user in their GUI session
             var uid = require('user-sessions').consoleUid();
             var user = require('user-sessions').getUsername(uid);
-            var script = 'set d to POSIX path of (path to downloads folder)\nset f to ""\ntry\ntell application "Finder" to if (count of Finder windows) > 0 then set f to POSIX path of (target of front Finder window as alias)\nend try\nreturn (ASCII character 2) & f & "|" & d & (ASCII character 3)';
+            var script = 'set d to POSIX path of (path to downloads folder)\nset k to POSIX path of (path to desktop folder)\nset f to ""\n' + (find ? 'try\ntell application "Finder" to if (count of Finder windows) > 0 then set f to POSIX path of (target of front Finder window as alias)\nend try\n' : '') + 'return (ASCII character 2) & f & "|" & k & "|" & d & (ASCII character 3)';
             var child = require('child_process').execFile('/bin/launchctl', ['launchctl', 'asuser', '' + uid, '/usr/bin/sudo', '-u', user, '/usr/bin/osascript', '-e', script]);
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
@@ -2639,30 +2661,31 @@ function getDropTarget(x, y, display, func) {
             child.on('exit', function () {
                 var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
                 var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
-                if (v[0]) { reply(v[0], 'folder'); }
-                else if (v[1]) { reply(v[1], 'downloads'); }
-                else { var home = '/Users/' + user; reply(fs.existsSync(home + '/Downloads') ? (home + '/Downloads') : null, 'downloads'); }
+                var home = '/Users/' + user;
+                var desktop = v[1] || (fs.existsSync(home + '/Desktop') ? (home + '/Desktop') : null);
+                var downloads = v[2] || (fs.existsSync(home + '/Downloads') ? (home + '/Downloads') : null);
+                if (!pick(v[0] || null, desktop, downloads, find ? 'no Finder window open' : null)) { reply(null, null, null, 'Could not find the user folders'); }
             });
         } else {
-            // Linux and others: the console user's XDG download folder, else ~/Downloads, else their home folder
+            // Linux and others: the console user's XDG folders, else ~/Downloads and ~/Desktop, else their home folder
             var uid = require('user-sessions').consoleUid();
             var home = require('user-sessions').findEnv(uid, 'HOME');
             if (home == null) { try { home = require('user-sessions').getHomeFolder(uid); } catch (ex) { } }
-            if (home == null) { reply(null, null); return; }
-            var dl = home + '/Downloads';
+            if (home == null) { reply(null, null, null, 'No logged in user found'); return; }
+            var dirs = { DOWNLOAD: home + '/Downloads', DESKTOP: home + '/Desktop' };
             try {
-                var dirs = fs.readFileSync(home + '/.config/user-dirs.dirs').toString().split('\n');
-                for (var i in dirs) {
-                    var m = dirs[i].trim();
-                    if (m.startsWith('XDG_DOWNLOAD_DIR=')) { m = m.substring(17).split('"').join('').split('$HOME').join(home); if (fs.existsSync(m)) { dl = m; } }
+                var lines = fs.readFileSync(home + '/.config/user-dirs.dirs').toString().split('\n');
+                for (var i in lines) {
+                    var m = lines[i].trim();
+                    for (var k in dirs) { if (m.startsWith('XDG_' + k + '_DIR=')) { m = m.substring(k.length + 9).split('"').join('').split('$HOME').join(home); if (fs.existsSync(m)) { dirs[k] = m; } } }
                 }
             } catch (ex) { }
-            reply(fs.existsSync(dl) ? dl : home, 'downloads');
+            pick(null, fs.existsSync(dirs.DESKTOP) ? dirs.DESKTOP : home, fs.existsSync(dirs.DOWNLOAD) ? dirs.DOWNLOAD : home, find ? 'not available on this system' : null);
         }
     } catch (ex) {
         // Could not run the helper, on Windows still try the user's Downloads folder
         var downloads = (process.platform == 'win32') ? getWindowsDownloadsFolder() : null;
-        if (downloads) { reply(downloads, 'downloads'); } else { reply(null, null, 'Folder lookup failed: ' + ex); }
+        if (downloads && (mode != 'desktop')) { reply(downloads, 'downloads', 'Folder lookup failed: ' + ex); } else { reply(null, null, null, 'Folder lookup failed: ' + ex); }
     }
 }
 
@@ -4489,8 +4512,8 @@ function onTunnelData(data)
                     {
                         // Find the folder for files dropped on the remote desktop
                         var tunnel = this;
-                        getDropTarget(cmd.x, cmd.y, cmd.display, function (r) {
-                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, error: r.error }))); } catch (ex) { }
+                        getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, function (r) {
+                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error }))); } catch (ex) { }
                         });
                         break;
                     }
