@@ -2634,20 +2634,13 @@ function getDropTarget(x, y, display, mode, func) {
                 "[Console]::Out.Write(([string][char]2) + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + '|' + (B64 $note) + ([string][char]3))", // Start from a string, [char] + string is not a concatenation
                 "[Console]::Out.Flush()"
             ].join('\r\n');
-            // The script goes in a file next to the agent (users can read it, not change it): as -EncodedCommand it makes
-            // a very long command line. Fall back to -EncodedCommand if the file can't be written.
-            var args = ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass'];
-            try {
-                var script = process.execPath.substring(0, process.execPath.lastIndexOf('\\') + 1) + 'droptarget.ps1';
-                fs.writeFileSync(script, ps);
-                args.push('-File', script);
-            } catch (ex) {
-                var u = Buffer.alloc(ps.length * 2); // -EncodedCommand takes UTF-16LE in base64
-                for (var i = 0; i < ps.length; i++) { var c = ps.charCodeAt(i); u[i * 2] = (c & 0xFF); u[(i * 2) + 1] = (c >> 8); }
-                args.push('-EncodedCommand', u.toString('base64'));
-            }
-            var options = { type: 1 }; // ILibProcessPipe_SpawnTypes_USER, the logged in user
-            if (require('MeshAgent')._tsid != null) { options = { type: 5, uid: require('MeshAgent')._tsid }; } // The session picked for remote desktop
+            // The script is passed in an environment variable (as win-deskutils does), which keeps the command line short
+            var env = {};
+            for (var e in process.env) { env[e] = process.env[e]; }
+            env['MESHDROPTARGET'] = Buffer.from(ps).toString('base64');
+            var args = ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-Command', '& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MESHDROPTARGET))))'];
+            var options = { type: 1, env: env }; // ILibProcessPipe_SpawnTypes_USER, the logged in user
+            if (require('MeshAgent')._tsid != null) { options = { type: 5, uid: require('MeshAgent')._tsid, env: env }; } // The session picked for remote desktop
             var child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', args, options);
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
@@ -2660,7 +2653,7 @@ function getDropTarget(x, y, display, mode, func) {
                     var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
                     var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null, note = v[3] ? b64(v[3]) : null;
                     var err = (child.stderr.str + ' ' + ((i < 0) ? child.stdout.str : '')).trim().substring(0, 300);
-                    if (v.length == 0) { note = 'the folder lookup printed nothing (exit code ' + code + ((args.indexOf('-File') >= 0) ? ', script file' : ', encoded command') + ')' + (err ? (': ' + err) : ''); }
+                    if (v.length == 0) { note = 'the folder lookup printed nothing (exit code ' + code + ')' + (err ? (': ' + err) : ''); }
                     if (!downloads) { downloads = getWindowsDownloadsFolder(); }
                     if (pick(folder, desktop, downloads, note)) return;
                     reply(null, null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
@@ -4529,9 +4522,8 @@ function onTunnelData(data)
                     {
                         // Find the folder for files dropped on the remote desktop
                         var tunnel = this;
-                        getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, function (r) {
-                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error, v: 2 }))); } catch (ex) { }
-                        });
+                        var droptargetReply = function (r) { try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error, v: 3 }))); } catch (ex) { } };
+                        try { getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, droptargetReply); } catch (ex) { droptargetReply({ path: null, error: 'Folder lookup failed: ' + ex }); }
                         break;
                     }
                 case 'uploaddone':
