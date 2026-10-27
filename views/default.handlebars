@@ -10521,7 +10521,7 @@
             if ((data.action != null) && (data.action.startsWith('upload'))) { if ((uploadFile != null) && (uploadFile.tunnel == t)) { p13gotUploadData(data); } return; }
             if ((data.action == 'droptarget') && (t.xpath == null)) {
                 if (t.xtimer) { clearTimeout(t.xtimer); delete t.xtimer; }
-                if (typeof data.path != 'string') { deskDropDone(t, false, "Could not find a folder on the remote device for the dropped files."); return; }
+                if (typeof data.path != 'string') { deskDropDone(t, false, "Could not find a folder on the remote device for the dropped files." + ((typeof data.error == 'string') ? ('<br />' + EscapeHtml(data.error)) : '')); return; }
                 t.xpath = data.path;
                 t.xkind = data.kind;
                 t.sendText({ action: 'ls', reqid: 2, path: t.xpath }); // List the folder to avoid overwriting files

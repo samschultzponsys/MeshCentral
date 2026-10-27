@@ -2535,17 +2535,18 @@ function getDirectoryInfo(reqpath) {
 
 // Find the folder for files dropped on the remote desktop. On Windows this is the Explorer window under the
 // drop point (x, y are pixels of the displayed screen), or the desktop itself. On macOS, the front Finder window.
-// Otherwise, the logged in user's Downloads folder. Calls func({ path, kind }), path is null if nothing was found.
+// Otherwise, the logged in user's Downloads folder. Calls func({ path, kind, error }), path is null if nothing was found
+// and error then says why.
 function getDropTarget(x, y, display, func) {
     var done = false;
-    function reply(path, kind) {
+    function reply(path, kind, error) {
         if (done) return;
         done = true;
         if ((typeof path == 'string') && (path.length > 1) && ((path.endsWith('/')) || (path.endsWith('\\') && (path.length > 3)))) { path = path.substring(0, path.length - 1); }
-        func({ path: path, kind: kind });
+        func({ path: path, kind: kind, error: error });
     }
     function b64(s) { try { return Buffer.from(s, 'base64').toString(); } catch (ex) { return null; } }
-    setTimeout(function () { reply(null, null); }, 20000); // Give up if the helper hangs
+    setTimeout(function () { reply(null, null, 'The folder lookup timed out'); }, 20000); // Give up if the helper hangs
     x = ((typeof x == 'number') && (x >= 0)) ? Math.floor(x) : -1;
     y = ((typeof y == 'number') && (y >= 0)) ? Math.floor(y) : -1;
     display = (typeof display == 'number') ? Math.floor(display) : 0;
@@ -2604,7 +2605,8 @@ function getDropTarget(x, y, display, func) {
                 "}",
                 "} catch { }",
                 "function B64($s) { if (-not $s) { return '' }; return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }",
-                "[Console]::Out.Write([char]2 + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + [char]3)"
+                "[Console]::Out.Write(([string][char]2) + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + ([string][char]3))", // Start from a string, [char] + string is not a concatenation
+                "[Console]::Out.Flush()"
             ].join('\r\n');
             var u = Buffer.alloc(ps.length * 2); // -EncodedCommand takes UTF-16LE in base64
             for (var i = 0; i < ps.length; i++) { var c = ps.charCodeAt(i); u[i * 2] = (c & 0xFF); u[(i * 2) + 1] = (c >> 8); }
@@ -2613,15 +2615,17 @@ function getDropTarget(x, y, display, func) {
             var child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', u.toString('base64')], options);
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
-            child.stderr.on('data', function (c) { });
-            child.on('exit', function () {
+            child.stderr.str = '';
+            child.stderr.on('data', function (c) { this.str += c.toString(); });
+            child.on('exit', function (code) {
                 var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
-                if ((i < 0) || (j < 0)) { reply(null, null); return; }
-                var v = s.substring(i + 1, j).split('|');
-                var folder = b64(v[0]), desktop = b64(v[1]), downloads = b64(v[2]);
-                if (folder) { reply(folder, (folder == desktop) ? 'desktop' : 'folder'); }
-                else if (downloads) { reply(downloads, 'downloads'); }
-                else { reply(null, null); }
+                var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
+                var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null;
+                if (folder) { reply(folder, (folder == desktop) ? 'desktop' : 'folder'); return; }
+                if (!downloads) { downloads = getWindowsDownloadsFolder(); }
+                if (downloads) { reply(downloads, 'downloads'); return; }
+                var err = (child.stderr.str + ' ' + child.stdout.str).trim().substring(0, 300);
+                reply(null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
             });
         } else if (process.platform == 'darwin') {
             // Ask Finder for its front window, run as the console user in their GUI session
@@ -2655,7 +2659,29 @@ function getDropTarget(x, y, display, func) {
             } catch (ex) { }
             reply(fs.existsSync(dl) ? dl : home, 'downloads');
         }
-    } catch (ex) { reply(null, null); }
+    } catch (ex) {
+        // Could not run the helper, on Windows still try the user's Downloads folder
+        var downloads = (process.platform == 'win32') ? getWindowsDownloadsFolder() : null;
+        if (downloads) { reply(downloads, 'downloads'); } else { reply(null, null, 'Folder lookup failed: ' + ex); }
+    }
+}
+
+// Downloads folder of the logged in Windows user, found from their profile folder in the registry. Null if not found.
+function getWindowsDownloadsFolder() {
+    try {
+        var user = require('user-sessions').getUsername(require('user-sessions').consoleUid());
+        if (!user) return null;
+        var reg = require('win-registry'), key = 'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList';
+        var profiles = reg.QueryKey(reg.HKEY.LocalMachine, key);
+        for (var i in profiles.subkeys) {
+            var p = null;
+            try { p = reg.QueryKey(reg.HKEY.LocalMachine, key + '\\' + profiles.subkeys[i], 'ProfileImagePath'); } catch (ex) { }
+            if (typeof p != 'string') continue;
+            p = p.split('%SystemDrive%').join(process.env['SystemDrive'] || 'C:');
+            if (p.toLowerCase().endsWith('\\' + user.toLowerCase()) && fs.existsSync(p + '\\Downloads')) { return p + '\\Downloads'; }
+        }
+    } catch (ex) { }
+    return null;
 }
 
 // Files written by the agent running as root into a folder owned by someone else take that folder's owner
@@ -4464,7 +4490,7 @@ function onTunnelData(data)
                         // Find the folder for files dropped on the remote desktop
                         var tunnel = this;
                         getDropTarget(cmd.x, cmd.y, cmd.display, function (r) {
-                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind }))); } catch (ex) { }
+                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, error: r.error }))); } catch (ex) { }
                         });
                         break;
                     }
