@@ -947,6 +947,9 @@ setTimeout(function () { try { require('remote-printer').cleanup(); } catch (ex)
 // A print job was received from the remote printer, send it to all users with remote printing active
 function onRemotePrintJob(job) {
     var path = job.path.split('\\').join('/');
+    var count = 0;
+    for (var i in remotePrintSessions) { count++; }
+    if (count == 0) { MeshServerLog('Remote printing job received, ' + job.size + ' byte(s), but no user has remote printing active'); }
     for (var i in remotePrintSessions) {
         MeshServerLog('Remote printing job, ' + job.size + ' byte(s)', remotePrintSessions[i]);
         mesh.SendCommand({ action: 'msg', type: 'remoteprint', sub: 'job', sessionid: i, path: path, name: job.name, size: job.size, format: job.format });
@@ -4846,7 +4849,7 @@ function processConsoleCommand(cmd, args, rights, sessionid) {
                 var fin = '', f = '', availcommands = 'domain,translations,agentupdate,errorlog,msh,timerinfo,coreinfo,coreinfoupdate,coredump,service,fdsnapshot,fdcount,startupoptions,';
                 availcommands += 'alert,agentsize,versions,help,info,osinfo,args,print,type,dbkeys,dbget,dbset,dbdelete,dbcompact,eval,parseuri,httpget,wslist,plugin,wsconnect,wssend,wsclose,notify,';
                 availcommands += 'ls,ps,kill,netinfo,location,power,wakeonlan,setdebug,smbios,rawsmbios,toast,lock,users,openurl,getclip,setclip,log,cpuinfo,sysinfo,';
-                availcommands += 'apf,scanwifi,wallpaper,agentmsg,task,uninstallagent,display,openfile,installedapps';
+                availcommands += 'apf,scanwifi,wallpaper,agentmsg,task,uninstallagent,display,openfile,installedapps,remoteprint';
                 if (require('os').dns != null) { availcommands += ',dnsinfo'; }
                 try { require('linux-dhcp'); availcommands += ',dhcp'; } catch (ex) { }
                 if (process.platform == 'win32') {
@@ -4959,6 +4962,22 @@ function processConsoleCommand(cmd, args, rights, sessionid) {
                         }
                     }
                 }
+                break;
+            case 'remoteprint':
+                // Show the state of remote printing and its recent events
+                try {
+                    var rpStatus = require('remote-printer').getStatus();
+                    var rpLines = ['Remote printing: ' + (rpStatus.supported ? 'supported' : 'not supported on this device')];
+                    rpLines.push('Printer: ' + ((rpStatus.printer != null) ? (rpStatus.printer.name + ', port ' + rpStatus.printer.port) : 'not installed') + ', listening: ' + rpStatus.listening + (rpStatus.busy ? ', installing or removing' : ''));
+                    var rpNow = Date.now(), rpCount = 0;
+                    for (var i in remotePrintSessions) { rpCount++; rpLines.push('User session: ' + remotePrintSessions[i].username + ', refreshed ' + Math.round((rpNow - remotePrintSessions[i].time) / 1000) + ' seconds ago'); }
+                    if (rpCount == 0) { rpLines.push('No user sessions'); }
+                    rpLines.push('Jobs folder: ' + rpStatus.jobsFolder);
+                    rpLines.push('Recent events:');
+                    if (rpStatus.history.length == 0) { rpLines.push('  none'); }
+                    for (var i in rpStatus.history) { rpLines.push('  ' + rpStatus.history[i]); }
+                    response = rpLines.join('\r\n');
+                } catch (ex) { response = 'Remote printing is not available: ' + ex; }
                 break;
             case 'privacybar':
                 if (process.platform != 'win32' || require('notifybar-desktop').DefaultPinned == null) {

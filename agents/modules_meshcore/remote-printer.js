@@ -47,6 +47,13 @@ var jobCounter = 0;
 var children = [];          // Keep a reference on running child processes
 var queue = [];             // Install / uninstall operations run one at a time
 var queueBusy = false;
+var startRequested = false; // Set once start() is called, so cleanup() doesn't remove a printer installed by this run
+var history = [];           // Recent events, shown by the "remoteprint" agent console command
+
+function log(msg) {
+    history.push(new Date().toISOString() + ' ' + msg);
+    if (history.length > 30) { history.shift(); }
+}
 
 // Minimal PPD, CUPS converts the job to PDF and sends it as-is to the socket backend
 var linuxPpd = [
@@ -207,7 +214,7 @@ function uninstallPrinter(func) {
     if (process.platform == 'win32') {
         var script = [
             "$ErrorActionPreference = 'SilentlyContinue'",
-            "Get-Printer | Where-Object { $_.PortName -like '" + PORT_PREFIX + "*' } | Remove-Printer",
+            "Get-Printer | Where-Object { $_.PortName -like '" + PORT_PREFIX + "*' } | ForEach-Object { Get-PrintJob -PrinterName $_.Name | Remove-PrintJob; $_ } | Remove-Printer",
             "Start-Sleep -Milliseconds 500",
             "Get-PrinterPort | Where-Object { $_.Name -like '" + PORT_PREFIX + "*' } | Remove-PrinterPort",
             "Write-Output 'OK'"
@@ -247,6 +254,7 @@ function startListener(port, onJob, func) {
     try { fs.mkdirSync(jobsFolder); } catch (ex) { }
     var s = require('net').createServer();
     s.on('connection', function (socket) {
+        if (s.onCheckConnection != null) { var f = s.onCheckConnection; s.onCheckConnection = null; f(); }
         var job = { id: ++jobCounter, time: Date.now(), size: 0, head: null, tail: '', fd: null, done: false, timer: null };
         job.tmpPath = jobsFolder + sep + 'print-' + job.time + '-' + job.id + '.tmp';
         try { job.fd = fs.openSync(job.tmpPath, 'wbN'); } catch (ex) { socket.end(); return; }
@@ -255,7 +263,11 @@ function startListener(port, onJob, func) {
         // So close it when the job is complete: when the other side ends it, or when no more data arrives.
         var restartTimer = function () {
             if (job.timer != null) { clearTimeout(job.timer); }
-            job.timer = setTimeout(finish, (job.tail.indexOf('%%EOF') >= 0) ? JOB_END_DELAY : JOB_IDLE_TIMEOUT);
+            if (job.tail.indexOf('%%EOF') >= 0) {
+                job.timer = setTimeout(function () { finish('end of PDF'); }, JOB_END_DELAY);
+            } else {
+                job.timer = setTimeout(function () { finish('no data for ' + (JOB_IDLE_TIMEOUT / 1000) + ' seconds'); }, JOB_IDLE_TIMEOUT);
+            }
         };
         socket.on('data', function (chunk) {
             if ((job.done) || (job.fd == null)) return;
@@ -263,10 +275,10 @@ function startListener(port, onJob, func) {
             job.tail = (job.tail + chunk.slice(Math.max(0, chunk.length - 32)).toString('binary')).slice(-32);
             job.size += chunk.length;
             restartTimer();
-            if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } finish(); return; }
+            if (job.size > MAX_JOB_SIZE) { try { fs.closeSync(job.fd); } catch (ex) { } job.fd = null; try { fs.unlinkSync(job.tmpPath); } catch (ex) { } finish('job too large, dropped'); return; }
             try { fs.writeSync(job.fd, chunk); } catch (ex) { }
         });
-        var finish = function () {
+        var finish = function (reason) {
             if (job.timer != null) { clearTimeout(job.timer); job.timer = null; }
             if (job.closing !== true) {
                 job.closing = true;
@@ -275,6 +287,7 @@ function startListener(port, onJob, func) {
             }
             if (job.done) return;
             job.done = true;
+            if (job.size > 0) { log('Job ' + job.id + ': ' + job.size + ' bytes, complete because: ' + reason); }
             if (job.fd == null) return; // Job was dropped
             try { fs.closeSync(job.fd); } catch (ex) { }
             if (job.size == 0) { try { fs.unlinkSync(job.tmpPath); } catch (ex) { } return; }
@@ -282,23 +295,44 @@ function startListener(port, onJob, func) {
             var name = 'print-' + job.time + '-' + job.id + '.' + ext;
             var path = jobsFolder + sep + name;
             try { fs.renameSync(job.tmpPath, path); } catch (ex) { path = job.tmpPath; name = 'print-' + job.time + '-' + job.id + '.tmp'; }
+            log('Job ' + job.id + ': saved as ' + name);
             cleanJobs(false);
             try { onJob({ path: path, name: name, size: job.size, format: ext }); } catch (ex) { }
         };
-        socket.on('end', finish);
-        socket.on('close', finish);
-        socket.on('error', finish);
+        socket.on('end', function () { finish('connection closed by the spooler'); });
+        socket.on('close', function () { finish('connection closed'); });
+        socket.on('error', function (err) { finish('connection error: ' + err); });
         restartTimer(); // Also closes connections that never send anything
     });
-    s.on('error', function (err) { });
+    s.on('error', function (err) { log('Listener error: ' + err); });
     try {
         s.listen({ port: port, host: '127.0.0.1' });
     } catch (ex) {
+        log('Unable to listen on port ' + port + ': ' + ex);
         func('Unable to listen on port ' + port);
         return;
     }
     server = s;
-    func(null);
+
+    // Check that the listener receives connections, if another program uses the port the connection goes to it instead
+    var checked = false;
+    var check = function (err) {
+        if (checked) return;
+        checked = true;
+        clearTimeout(checkTimer);
+        s.onCheckConnection = null;
+        try { if (c != null) { c.end(); } } catch (ex) { }
+        if (err != null) { log('Listener check failed on port ' + port + ': ' + err); stopListener(); func('Unable to receive print jobs on port ' + port + ' (' + err + ')'); return; }
+        log('Listening on 127.0.0.1:' + port);
+        func(null);
+    };
+    var checkTimer = setTimeout(function () { check('no connection received, is the port used by another program?'); }, 5000);
+    s.onCheckConnection = function () { check(null); };
+    var c = null;
+    try {
+        c = require('net').createConnection({ host: '127.0.0.1', port: port });
+        c.on('error', function (err) { check(String(err)); });
+    } catch (ex) { check(String(ex)); }
 }
 
 function stopListener() {
@@ -313,6 +347,7 @@ function start(options, onJob, func) {
     var name = cleanName(options.printerName);
     var port = parseInt(options.port);
     if (isNaN(port) || (port < 1024) || (port > 65535)) { port = DEFAULT_TCP_PORT; }
+    startRequested = true;
     runQueued(function (done) {
         if (isSupported() == false) { func('Remote printing is not supported on this device'); done(); return; }
         if ((current != null) && (current.name == name) && (current.port == port) && (server != null)) { func(null, current); done(); return; } // Already running
@@ -321,6 +356,7 @@ function start(options, onJob, func) {
             if (err != null) { func(err); done(); return; }
             installPrinter(name, port, function (err) {
                 if (err != null) {
+                    log('Printer install failed: ' + err);
                     stopListener();
                     current = null;
                     uninstallPrinter(function () { func(err); done(); });
@@ -328,6 +364,7 @@ function start(options, onJob, func) {
                 }
                 current = { name: name, port: port };
                 writeMarker(current);
+                log('Printer installed: ' + name);
                 func(null, current);
                 done();
             });
@@ -340,6 +377,7 @@ function stop(func) {
     runQueued(function (done) {
         stopListener();
         current = null;
+        log('Stopping, removing the printer');
         uninstallPrinter(function () {
             cleanJobs(true);
             if (func) { try { func(); } catch (ex) { } }
@@ -350,9 +388,14 @@ function stop(func) {
 
 // Remove a printer left behind by a previous run (agent crash or restart while printing was active)
 function cleanup() {
-    if (readMarker() != null) { stop(); } else { cleanJobs(true); }
+    if (startRequested) return; // Remote printing was already started by this run, the printer is in use
+    if (readMarker() != null) { log('Removing a printer left by a previous run'); stop(); } else { cleanJobs(true); }
 }
 
 function isRunning() { return (current != null); }
 
-module.exports = { start: start, stop: stop, cleanup: cleanup, isRunning: isRunning, isSupported: isSupported, jobsFolder: jobsFolder };
+function getStatus() {
+    return { supported: isSupported(), printer: current, listening: (server != null), busy: queueBusy, jobsFolder: jobsFolder, history: history.slice() };
+}
+
+module.exports = { start: start, stop: stop, cleanup: cleanup, isRunning: isRunning, isSupported: isSupported, getStatus: getStatus, jobsFolder: jobsFolder };
