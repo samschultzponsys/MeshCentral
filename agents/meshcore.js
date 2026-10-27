@@ -2481,11 +2481,17 @@ function getDirectoryInfo(reqpath) {
 // screen), the desktop itself, the foreground Explorer window, or the only open Explorer window; on macOS the front
 // Finder window; else the Downloads folder. Calls func({ path, kind, note, error }): note tells why the folder
 // under the drop point was not used, path is null if nothing was found and error then says why.
-function getDropTarget(x, y, display, mode, func) {
-    var done = false;
+// Lookups in progress, keeps the helper process and timer referenced so they are not collected before they finish
+var dropTargetLookups = {}, dropTargetLookupId = 0;
+function getDropTarget(x, y, display, mode, func, trace) {
+    var done = false, id = ++dropTargetLookupId, lookup = dropTargetLookups[id] = {};
+    function step(msg) { if (typeof trace == 'function') { try { trace('Drop target: ' + msg); } catch (ex) { } } }
     function reply(path, kind, note, error) {
         if (done) return;
         done = true;
+        if (lookup.timer != null) { clearTimeout(lookup.timer); }
+        delete dropTargetLookups[id];
+        step('reply ' + JSON.stringify({ path: path, kind: kind, note: note, error: error }));
         if ((typeof path == 'string') && (path.length > 1) && ((path.endsWith('/')) || (path.endsWith('\\') && (path.length > 3)))) { path = path.substring(0, path.length - 1); }
         func({ path: path, kind: kind, note: note, error: error });
     }
@@ -2500,7 +2506,8 @@ function getDropTarget(x, y, display, mode, func) {
         }
         return false;
     }
-    setTimeout(function () { reply(null, null, null, 'The folder lookup timed out'); }, 20000); // Give up if the helper hangs
+    lookup.timer = setTimeout(function () { reply(null, null, null, 'The folder lookup timed out'); }, 20000); // Give up if the helper hangs
+    step('start, mode ' + mode + ', point ' + x + ',' + y + ', display ' + display);
     var find = ((mode != 'desktop') && (mode != 'downloads'));
     x = ((typeof x == 'number') && (x >= 0)) ? Math.floor(x) : -1;
     y = ((typeof y == 'number') && (y >= 0)) ? Math.floor(y) : -1;
@@ -2581,14 +2588,17 @@ function getDropTarget(x, y, display, mode, func) {
             var args = ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-Command', '& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MESHDROPTARGET))))'];
             var options = { type: 1, env: env }; // ILibProcessPipe_SpawnTypes_USER, the logged in user
             if (require('MeshAgent')._tsid != null) { options = { type: 5, uid: require('MeshAgent')._tsid, env: env }; } // The session picked for remote desktop
-            var child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', args, options);
+            step('starting PowerShell as ' + ((options.type == 5) ? ('session ' + options.uid) : 'the logged in user'));
+            var child = lookup.child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', args, options);
+            step('PowerShell started');
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
             child.stderr.str = '';
             child.stderr.on('data', function (c) { this.str += c.toString(); });
             child.on('exit', function (code) {
+                step('PowerShell exited, code ' + code + ', output ' + child.stdout.str.length + ' chars, errors ' + child.stderr.str.length + ' chars');
                 // Output can still be in the pipe when the exit event fires, read it a moment later
-                setTimeout(function () {
+                lookup.readTimer = setTimeout(function () {
                     var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
                     var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
                     var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null, note = v[3] ? b64(v[3]) : null;
@@ -2604,7 +2614,7 @@ function getDropTarget(x, y, display, mode, func) {
             var uid = require('user-sessions').consoleUid();
             var user = require('user-sessions').getUsername(uid);
             var script = 'set d to POSIX path of (path to downloads folder)\nset k to POSIX path of (path to desktop folder)\nset f to ""\n' + (find ? 'try\ntell application "Finder" to if (count of Finder windows) > 0 then set f to POSIX path of (target of front Finder window as alias)\nend try\n' : '') + 'return (ASCII character 2) & f & "|" & k & "|" & d & (ASCII character 3)';
-            var child = require('child_process').execFile('/bin/launchctl', ['launchctl', 'asuser', '' + uid, '/usr/bin/sudo', '-u', user, '/usr/bin/osascript', '-e', script]);
+            var child = lookup.child = require('child_process').execFile('/bin/launchctl', ['launchctl', 'asuser', '' + uid, '/usr/bin/sudo', '-u', user, '/usr/bin/osascript', '-e', script]);
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
             child.stderr.on('data', function (c) { });
@@ -4463,7 +4473,7 @@ function onTunnelData(data)
                         // Find the folder for files dropped on the remote desktop
                         var tunnel = this;
                         var droptargetReply = function (r) { try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error, v: 3 }))); } catch (ex) { } };
-                        try { getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, droptargetReply); } catch (ex) { droptargetReply({ path: null, error: 'Folder lookup failed: ' + ex }); }
+                        try { getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, droptargetReply, (cmd.trace === true) ? sendConsoleText : null); } catch (ex) { droptargetReply({ path: null, error: 'Folder lookup failed: ' + ex }); }
                         break;
                     }
                 case 'uploaddone':
