@@ -2631,23 +2631,37 @@ function getDropTarget(x, y, display, mode, func) {
                 "[Console]::Out.Write(([string][char]2) + (B64 $folder) + '|' + (B64 $desktop) + '|' + (B64 $downloads) + '|' + (B64 $note) + ([string][char]3))", // Start from a string, [char] + string is not a concatenation
                 "[Console]::Out.Flush()"
             ].join('\r\n');
-            var u = Buffer.alloc(ps.length * 2); // -EncodedCommand takes UTF-16LE in base64
-            for (var i = 0; i < ps.length; i++) { var c = ps.charCodeAt(i); u[i * 2] = (c & 0xFF); u[(i * 2) + 1] = (c >> 8); }
+            // The script goes in a file next to the agent (users can read it, not change it): as -EncodedCommand it makes
+            // a very long command line. Fall back to -EncodedCommand if the file can't be written.
+            var args = ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass'];
+            try {
+                var script = process.execPath.substring(0, process.execPath.lastIndexOf('\\') + 1) + 'droptarget.ps1';
+                fs.writeFileSync(script, ps);
+                args.push('-File', script);
+            } catch (ex) {
+                var u = Buffer.alloc(ps.length * 2); // -EncodedCommand takes UTF-16LE in base64
+                for (var i = 0; i < ps.length; i++) { var c = ps.charCodeAt(i); u[i * 2] = (c & 0xFF); u[(i * 2) + 1] = (c >> 8); }
+                args.push('-EncodedCommand', u.toString('base64'));
+            }
             var options = { type: 1 }; // ILibProcessPipe_SpawnTypes_USER, the logged in user
             if (require('MeshAgent')._tsid != null) { options = { type: 5, uid: require('MeshAgent')._tsid }; } // The session picked for remote desktop
-            var child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', ['powershell', '-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', u.toString('base64')], options);
+            var child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', args, options);
             child.stdout.str = '';
             child.stdout.on('data', function (c) { this.str += c.toString(); });
             child.stderr.str = '';
             child.stderr.on('data', function (c) { this.str += c.toString(); });
             child.on('exit', function (code) {
-                var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
-                var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
-                var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null, note = v[3] ? b64(v[3]) : null;
-                if (!downloads) { downloads = getWindowsDownloadsFolder(); }
-                if (pick(folder, desktop, downloads, note)) return;
-                var err = (child.stderr.str + ' ' + child.stdout.str).trim().substring(0, 300);
-                reply(null, null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
+                // Output can still be in the pipe when the exit event fires, read it a moment later
+                setTimeout(function () {
+                    var s = child.stdout.str, i = s.indexOf('\x02'), j = s.indexOf('\x03', i);
+                    var v = ((i < 0) || (j < 0)) ? [] : s.substring(i + 1, j).split('|');
+                    var folder = v[0] ? b64(v[0]) : null, desktop = v[1] ? b64(v[1]) : null, downloads = v[2] ? b64(v[2]) : null, note = v[3] ? b64(v[3]) : null;
+                    var err = (child.stderr.str + ' ' + ((i < 0) ? child.stdout.str : '')).trim().substring(0, 300);
+                    if (v.length == 0) { note = 'the folder lookup printed nothing (exit code ' + code + ((args.indexOf('-File') >= 0) ? ', script file' : ', encoded command') + ')' + (err ? (': ' + err) : ''); }
+                    if (!downloads) { downloads = getWindowsDownloadsFolder(); }
+                    if (pick(folder, desktop, downloads, note)) return;
+                    reply(null, null, null, 'Folder lookup failed (exit code ' + code + ')' + (err ? (': ' + err) : ''));
+                }, 300);
             });
         } else if (process.platform == 'darwin') {
             // Ask Finder for its front window, run as the console user in their GUI session
@@ -4513,7 +4527,7 @@ function onTunnelData(data)
                         // Find the folder for files dropped on the remote desktop
                         var tunnel = this;
                         getDropTarget(cmd.x, cmd.y, cmd.display, cmd.mode, function (r) {
-                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error }))); } catch (ex) { }
+                            try { tunnel.write(Buffer.from(JSON.stringify({ action: 'droptarget', reqid: cmd.reqid, path: r.path, kind: r.kind, note: r.note, error: r.error, v: 2 }))); } catch (ex) { }
                         });
                         break;
                     }

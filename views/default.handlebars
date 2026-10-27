@@ -10550,6 +10550,7 @@
                 t.xpath = data.path;
                 t.xkind = data.kind;
                 t.xnote = data.note;
+                if ((data.v == null) && (data.kind == 'downloads')) { t.xnote = "the agent is running older code, reconnect it to update"; }
                 t.sendText({ action: 'ls', reqid: 2, path: t.xpath }); // List the folder to avoid overwriting files
             } else if ((data.reqid == 2) && (t.xpath != null) && (t.xnames == null)) {
                 if (data.dir == null) { deskDropDone(t, false, format("Could not open {0} on the remote device.", t.xpath)); return; }
