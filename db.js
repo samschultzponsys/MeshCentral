@@ -4470,7 +4470,7 @@ module.exports.CreateDB = function (parent, func) {
     function dbNameFilter(filter) { return ((typeof filter == 'string') && (filter.trim() != '')) ? filter.trim().toLowerCase() : null; }
     function dbNameFilterLike(filter) { return '%' + filter.replace(/[\\%_]/g, function (c) { return '\\' + c; }) + '%'; }
     // Device name filters are split into words on spaces and symbols, a name matches when it contains all the words in any order.
-    function dbNameFilterWords(filter) { const words = filter.split(/[\s!-\/:-@\[-`{-~]+/).filter(function (w) { return w != ''; }); return (words.length == 0) ? [filter] : words; }
+    function dbNameFilterWords(filter) { const words = filter.split(/[\s!-\/:-@\[-`{-~¡-¿×÷‐-‧‰-⁞　-〿！-／：-＠]+/).filter(function (w) { return w != ''; }); return (words.length == 0) ? [filter] : words; }
     function dbNameFilterRegExp(filter) { return new RegExp('^' + dbNameFilterWords(filter).map(function (w) { return '(?=.*' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')'; }).join(''), 'is'); }
 
     return obj;
